@@ -1,33 +1,51 @@
 // Package storage provides a concurrent-safe in-memory key-value store
-// with TTL expiry, absolute-timestamp eviction, and a background sweeper.
+// with TTL expiry, absolute-timestamp eviction, a background sweeper,
+// and optional LRU eviction when a capacity limit is set.
 package storage
 
 import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/Lenecplusultra/distributed-kv-store/internal/lru"
 )
 
 // Entry holds a value and its optional expiry metadata.
 type Entry struct {
 	Value     string
-	ExpiresAt time.Time // absolute wall-clock time, only valid when HasTTL is true
+	ExpiresAt time.Time
 	HasTTL    bool
 }
 
 // Store is a thread-safe in-memory key-value store.
 //
-// Concurrency model: sync.RWMutex allows many concurrent readers
-// but gives writers exclusive access. No other package writes to
-// the internal map directly.
+// If capacity > 0, the store uses LRU eviction to stay within the limit.
+// If capacity == 0, the store grows without bound (original behaviour).
+//
+// Locking model: the RWMutex covers both the data map and the LRU cache.
+// The LRU cache is not independently locked — it relies on the store's
+// lock. This avoids nested locks and the deadlocks they invite.
 type Store struct {
-	mu   sync.RWMutex
-	data map[string]Entry
+	mu       sync.RWMutex
+	data     map[string]Entry
+	cache    *lru.Cache // nil when capacity == 0
+	capacity int        // 0 = unlimited
 }
 
-// New creates and returns an empty Store.
+// New creates an unlimited Store (no eviction).
 func New() *Store {
 	return &Store{data: make(map[string]Entry)}
+}
+
+// NewWithCapacity creates a Store that evicts the least recently used
+// key when the number of entries would exceed capacity.
+func NewWithCapacity(capacity int) *Store {
+	return &Store{
+		data:     make(map[string]Entry, capacity),
+		cache:    lru.New(capacity),
+		capacity: capacity,
+	}
 }
 
 // Set stores a key-value pair with no expiry.
@@ -35,18 +53,15 @@ func (s *Store) Set(key, value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data[key] = Entry{Value: value}
+	s.evictIfNeeded(key)
 }
 
 // SetWithTTL stores a key that expires after ttl duration from now.
-// Internally converts to an absolute timestamp so the expiry is
-// wall-clock correct even if the server restarts.
 func (s *Store) SetWithTTL(key, value string, ttl time.Duration) {
 	s.SetWithExpiry(key, value, time.Now().Add(ttl))
 }
 
 // SetWithExpiry stores a key with a pre-computed absolute expiry time.
-// Used during WAL replay, where the original expiry timestamp is restored
-// directly — not recomputed from a relative duration.
 func (s *Store) SetWithExpiry(key, value string, expiresAt time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -55,15 +70,15 @@ func (s *Store) SetWithExpiry(key, value string, expiresAt time.Time) {
 		ExpiresAt: expiresAt,
 		HasTTL:    true,
 	}
+	s.evictIfNeeded(key)
 }
 
 // Get retrieves a value by key.
 // Returns ("", false) if the key does not exist or has expired.
-// Expiry is checked lazily on read — the background sweeper handles
-// bulk cleanup; this handles the single-key fast path.
+// A successful Get counts as a recent access for LRU purposes.
 func (s *Store) Get(key string) (string, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock() // Write lock — LRU Touch modifies the list.
+	defer s.mu.Unlock()
 
 	entry, ok := s.data[key]
 	if !ok {
@@ -72,6 +87,11 @@ func (s *Store) Get(key string) (string, bool) {
 	if entry.HasTTL && time.Now().After(entry.ExpiresAt) {
 		return "", false
 	}
+
+	if s.cache != nil {
+		s.cache.Touch(key) // existing key — no eviction possible
+	}
+
 	return entry.Value, true
 }
 
@@ -83,32 +103,37 @@ func (s *Store) Delete(key string) bool {
 	_, ok := s.data[key]
 	if ok {
 		delete(s.data, key)
+		if s.cache != nil {
+			s.cache.Remove(key)
+		}
 	}
 	return ok
 }
 
 // Len returns the number of entries currently in the map.
-// Includes expired keys not yet swept — use for metrics, not correctness.
 func (s *Store) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.data)
 }
 
+// evictIfNeeded tells the LRU cache about the access and removes the
+// evicted key from the data map if capacity is exceeded.
+// Must be called with s.mu write lock held.
+func (s *Store) evictIfNeeded(key string) {
+	if s.cache == nil {
+		return
+	}
+	evicted, ok := s.cache.Touch(key)
+	if ok {
+		// Eviction is a memory decision — not written to WAL.
+		// On restart, WAL replay restores it and LRU starts fresh.
+		delete(s.data, evicted)
+	}
+}
+
 // StartSweeper launches a background goroutine that periodically evicts
-// expired keys from the map. It runs until ctx is cancelled.
-//
-// Why a sweeper in addition to lazy expiry?
-// Lazy expiry only cleans keys when they are read. Keys that are written
-// with a TTL and never read again would stay in memory forever.
-// The sweeper catches those.
-//
-// Why two phases (RLock then WLock)?
-// Holding a write lock while scanning the entire map would block all
-// readers for the full scan duration. Instead: scan cheaply under a
-// read lock, collect the expired keys, then acquire a write lock only
-// to delete them. The re-check inside the write lock handles the race
-// where a key is refreshed between the two phases.
+// expired keys. Runs until ctx is cancelled.
 func (s *Store) StartSweeper(ctx context.Context, interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -124,9 +149,8 @@ func (s *Store) StartSweeper(ctx context.Context, interval time.Duration) {
 	}()
 }
 
-// sweep performs one eviction pass. Called by the sweeper goroutine.
+// sweep performs one TTL eviction pass.
 func (s *Store) sweep() {
-	// Phase 1: collect expired keys under read lock — readers not blocked.
 	s.mu.RLock()
 	var expired []string
 	now := time.Now()
@@ -141,13 +165,14 @@ func (s *Store) sweep() {
 		return
 	}
 
-	// Phase 2: delete under write lock — re-verify each key because a
-	// concurrent Set may have refreshed it between phase 1 and here.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, k := range expired {
 		if e, ok := s.data[k]; ok && e.HasTTL && time.Now().After(e.ExpiresAt) {
 			delete(s.data, k)
+			if s.cache != nil {
+				s.cache.Remove(k)
+			}
 		}
 	}
 }
