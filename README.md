@@ -54,25 +54,23 @@ A multi-node key-value database supporting:
 ```
 distributed-kv-store/
 ├── cmd/
-│   ├── server/         # server entrypoint
-│   └── client/         # CLI client entrypoint
+│   ├── server/
+│   └── client/
 ├── internal/
-│   ├── storage/        # concurrent KV store + TTL
+│   ├── storage/        # concurrent KV store + TTL + sweeper
 │   ├── protocol/       # wire protocol parsing
-│   ├── networking/     # TCP server/client
-│   ├── hashing/        # consistent hash ring
-│   ├── cluster/        # node registry + routing
-│   ├── replication/    # primary/replica sync
-│   ├── persistence/    # append-only log
-│   ├── ratelimiter/    # token bucket limiter
-│   └── metrics/        # observability
-├── tests/              # integration + unit tests
-├── docs/               # architecture docs + phase plan
+│   ├── tcp/            # TCP server/client
+│   ├── wal/            # append-only log (Phase 2)
+│   ├── lru/            # LRU eviction (Phase 3)
+│   ├── hashing/        # consistent hash ring (Phase 4)
+│   ├── cluster/        # node registry + routing (Phase 4)
+│   ├── replication/    # primary/replica sync (Phase 5)
+│   └── metrics/        # observability (Phase 8)
+├── docs/
 ├── deployments/
 │   ├── docker/
 │   └── kubernetes/
 ├── Makefile
-├── docker-compose.yml  (coming Phase 9)
 └── go.mod
 ```
 
@@ -125,8 +123,8 @@ PING                    → +PONG
 
 | Phase | Feature                         | Status        |
 |-------|---------------------------------|---------------|
-| 1     | Single-node TCP KV store        | 🔨 In progress |
-| 2     | Append-only persistence         | 📋 Planned    |
+| 1     | Single-node TCP KV store        | ✅ Complete   |
+| 2     | Append-only persistence         | 🔨 In progress |
 | 3     | LRU eviction                    | 📋 Planned    |
 | 4     | Consistent hashing + clustering | 📋 Planned    |
 | 5     | Replication                     | 📋 Planned    |
