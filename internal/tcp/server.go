@@ -1,9 +1,10 @@
 // Package tcp implements the TCP server that accepts client connections
 // and dispatches parsed commands to the storage layer.
 //
-// Each client connection gets its own goroutine. The store handles
-// its own locking, so goroutines can issue reads/writes concurrently
-// without any coordination at this layer.
+// Phase 2 addition: every mutating command (SET, DEL) is written to the
+// WAL before being applied to the store. If the WAL write fails, the
+// command is rejected — better to return an error than to accept a write
+// that cannot be recovered after a crash.
 package tcp
 
 import (
@@ -18,23 +19,25 @@ import (
 
 	"github.com/Lenecplusultra/distributed-kv-store/internal/protocol"
 	"github.com/Lenecplusultra/distributed-kv-store/internal/storage"
+	"github.com/Lenecplusultra/distributed-kv-store/internal/wal"
 )
 
-// Server wraps a TCP listener and the shared store.
+// Server wraps a TCP listener, the shared store, and an optional WAL.
+// If wal is nil, writes are applied to the store only (no persistence).
+// Passing nil is useful in tests that don't need durability.
 type Server struct {
 	addr     string
 	store    *storage.Store
+	wal      *wal.WAL // nil = no persistence
 	listener net.Listener
 }
 
-// New creates a Server bound to addr using the given store.
-func New(addr string, store *storage.Store) *Server {
-	return &Server{addr: addr, store: store}
+// New creates a Server. Pass nil for w to disable WAL persistence.
+func New(addr string, store *storage.Store, w *wal.WAL) *Server {
+	return &Server{addr: addr, store: store, wal: w}
 }
 
-// Start begins listening for connections. Blocks until the listener
-// is closed (e.g. via Shutdown). Each accepted connection is handled
-// in its own goroutine.
+// Start begins listening for connections. Blocks until Shutdown is called.
 func (s *Server) Start() error {
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
@@ -46,35 +49,27 @@ func (s *Server) Start() error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			// Listener was closed — clean shutdown.
-			return nil
+			return nil // listener closed — clean shutdown
 		}
 		go s.handleConn(conn)
 	}
 }
 
-// Shutdown closes the listener, causing Start to return.
+// Shutdown closes the listener, unblocking Start.
 func (s *Server) Shutdown() {
 	if s.listener != nil {
 		s.listener.Close()
 	}
 }
 
-// handleConn runs in its own goroutine for each client.
-// It reads newline-delimited commands, dispatches them, and writes responses.
-//
-// Using bufio.Reader here is a deliberate choice: it buffers reads from
-// the socket so we issue one syscall per line rather than one syscall per
-// byte. At high connection counts this matters significantly.
+// handleConn runs in its own goroutine for each connected client.
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 	remote := conn.RemoteAddr().String()
 	log.Printf("[server] client connected: %s", remote)
 
 	reader := bufio.NewReader(conn)
-
 	for {
-		// ReadString blocks until '\n' or EOF/error.
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err != io.EOF {
@@ -89,18 +84,14 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
-		response := s.dispatch(cmd)
-		fmt.Fprint(conn, response)
+		fmt.Fprint(conn, s.dispatch(cmd))
 	}
 
 	log.Printf("[server] client disconnected: %s", remote)
 }
 
-// dispatch routes a parsed command to the appropriate store operation
-// and returns the formatted response string.
-//
-// This is the single place where command names are mapped to behavior.
-// Adding a new command means adding a case here and in the protocol docs.
+// dispatch routes a command to the store, writing to the WAL first for
+// mutating operations. Returns the formatted response string.
 func (s *Server) dispatch(cmd *protocol.Command) string {
 	switch cmd.Name {
 
@@ -115,21 +106,37 @@ func (s *Server) dispatch(cmd *protocol.Command) string {
 		}
 		key, value := cmd.Args[0], cmd.Args[1]
 
-		// Check for optional EX <seconds> suffix
+		// Build the WAL entry before touching the store.
+		// We compute the absolute expiry here so both the WAL entry
+		// and the store write use the exact same timestamp.
+		entry := wal.Entry{Op: "SET", Key: key, Value: value}
+
 		if len(cmd.Args) >= 4 && strings.ToUpper(cmd.Args[2]) == "EX" {
 			secs, err := strconv.Atoi(cmd.Args[3])
 			if err != nil || secs <= 0 {
 				return protocol.Err("EX requires a positive integer")
 			}
-			s.store.SetWithTTL(key, value, time.Duration(secs)*time.Second)
-			return protocol.OK("OK")
+			entry.HasTTL = true
+			entry.ExpiresAt = time.Now().Add(time.Duration(secs) * time.Second)
 		}
 
-		s.store.Set(key, value)
+		// WAL write first — reject the command if durability fails.
+		if s.wal != nil {
+			if err := s.wal.Append(entry); err != nil {
+				log.Printf("[server] WAL append error: %v", err)
+				return protocol.Err("internal error: persistence failed")
+			}
+		}
+
+		// Apply to in-memory store.
+		if entry.HasTTL {
+			s.store.SetWithExpiry(key, value, entry.ExpiresAt)
+		} else {
+			s.store.Set(key, value)
+		}
 		return protocol.OK("OK")
 
 	case "GET":
-		// GET <key>
 		if len(cmd.Args) < 1 {
 			return protocol.Err("GET requires a key")
 		}
@@ -140,17 +147,25 @@ func (s *Server) dispatch(cmd *protocol.Command) string {
 		return protocol.OK(val)
 
 	case "DEL":
-		// DEL <key>
 		if len(cmd.Args) < 1 {
 			return protocol.Err("DEL requires a key")
 		}
-		existed := s.store.Delete(cmd.Args[0])
-		if !existed {
+
+		// WAL write first.
+		if s.wal != nil {
+			entry := wal.Entry{Op: "DEL", Key: cmd.Args[0]}
+			if err := s.wal.Append(entry); err != nil {
+				log.Printf("[server] WAL append error: %v", err)
+				return protocol.Err("internal error: persistence failed")
+			}
+		}
+
+		if !s.store.Delete(cmd.Args[0]) {
 			return protocol.Err("key not found")
 		}
 		return protocol.OK("OK")
 
 	default:
-		return protocol.Err(fmt.Sprintf("unknown command '%s'", cmd.Name))
+		return protocol.Err(fmt.Sprintf("unknown command %q", cmd.Name))
 	}
 }

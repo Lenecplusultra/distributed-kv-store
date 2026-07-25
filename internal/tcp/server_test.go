@@ -18,7 +18,7 @@ func testServer(t *testing.T, port string) (send func(string) string, cleanup fu
 	t.Helper()
 	addr := "127.0.0.1:" + port
 	store := storage.New()
-	srv := tcp.New(addr, store)
+	srv := tcp.New(addr, store, nil)
 
 	go srv.Start()
 	time.Sleep(40 * time.Millisecond) // let listener bind
