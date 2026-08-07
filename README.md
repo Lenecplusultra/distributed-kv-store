@@ -124,11 +124,11 @@ PING                    → +PONG
 | Phase | Feature                         | Status        |
 |-------|---------------------------------|---------------|
 | 1     | Single-node TCP KV store        | ✅ Complete   |
-| 2     | Append-only persistence         | 🔨 In progress |
-| 3     | LRU eviction                    | 📋 Planned    |
-| 4     | Consistent hashing + clustering | 📋 Planned    |
-| 5     | Replication                     | 📋 Planned    |
-| 6     | Failure detection + heartbeats  | 📋 Planned    |
+| 2     | Append-only persistence         | ✅ Complete   |
+| 3     | LRU eviction                    | ✅ Complete   |
+| 4     | Consistent hashing + clustering | ✅ Complete   |
+| 5     | Replication                     | ✅ Complete   |
+| 6     | Failure detection + heartbeats  | 🔨 In progress|
 | 7     | Token-bucket rate limiting      | 📋 Planned    |
 | 8     | Observability + benchmarks      | 📋 Planned    |
 | 9     | Docker + Kubernetes + CI/CD     | 📋 Planned    |
