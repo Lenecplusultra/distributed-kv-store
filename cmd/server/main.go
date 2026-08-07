@@ -1,99 +1,185 @@
-// Command server is the entrypoint for the distributed-kv-store node.
-//
-// Environment variables:
-//
-//	ADDR      bind address (default :6379)
-//	WAL_PATH  path to WAL file (default data/wal.log)
-//	REPLICAS  comma-separated replica addresses (e.g. localhost:6380,localhost:6381)
-//	          if empty, node runs without replication
-//
-// Startup sequence:
-//  1. Open WAL
-//  2. Replay WAL → restore store
-//  3. Start TTL sweeper
-//  4. Configure replicator (if REPLICAS set)
-//  5. Start TCP server
-package main
+// Package tcp implements the TCP server that accepts client connections
+// and dispatches parsed commands to the storage layer.
+package tcp
 
 import (
-	"context"
+	"bufio"
+	"fmt"
+	"io"
 	"log"
-	"os"
-	"os/signal"
-	"path/filepath"
+	"net"
+	"strconv"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
 
+	"github.com/Lenecplusultra/distributed-kv-store/internal/protocol"
 	"github.com/Lenecplusultra/distributed-kv-store/internal/replication"
 	"github.com/Lenecplusultra/distributed-kv-store/internal/storage"
-	"github.com/Lenecplusultra/distributed-kv-store/internal/tcp"
 	"github.com/Lenecplusultra/distributed-kv-store/internal/wal"
 )
 
-func main() {
-	addr := env("ADDR", ":6379")
-	walPath := env("WAL_PATH", "data/wal.log")
+// Server wraps a TCP listener, the shared store, an optional WAL,
+// and an optional Replicator.
+type Server struct {
+	addr       string
+	store      *storage.Store
+	wal        *wal.WAL
+	replicator *replication.Replicator
 
-	// ── 1. Open WAL ───────────────────────────────────────────────────────────
-	if err := os.MkdirAll(filepath.Dir(walPath), 0755); err != nil {
-		log.Fatalf("[startup] create WAL dir: %v", err)
-	}
-	w, err := wal.Open(walPath)
-	if err != nil {
-		log.Fatalf("[startup] open WAL: %v", err)
-	}
-	defer w.Close()
-
-	// ── 2. Replay WAL ─────────────────────────────────────────────────────────
-	store := storage.New()
-	log.Printf("[startup] replaying WAL from %s", walPath)
-	if err := wal.Recover(w, store); err != nil {
-		log.Fatalf("[startup] WAL recovery failed: %v", err)
-	}
-	log.Printf("[startup] recovery complete — %d keys restored", store.Len())
-
-	// ── 3. Start TTL sweeper ──────────────────────────────────────────────────
-	ctx, cancel := context.WithCancel(context.Background())
-	store.StartSweeper(ctx, 5*time.Second)
-
-	// ── 4. Configure replicator ───────────────────────────────────────────────
-	var r *replication.Replicator
-	if replicasEnv := env("REPLICAS", ""); replicasEnv != "" {
-		var addrs []string
-		for _, a := range strings.Split(replicasEnv, ",") {
-			if a = strings.TrimSpace(a); a != "" {
-				addrs = append(addrs, a)
-			}
-		}
-		if len(addrs) > 0 {
-			r = replication.New(addrs)
-			log.Printf("[startup] replication enabled → %v", addrs)
-		}
-	}
-
-	// ── 5. Start TCP server ───────────────────────────────────────────────────
-	server := tcp.New(addr, store, w, r)
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-quit
-		log.Println("[server] shutdown signal received")
-		cancel()
-		server.Shutdown()
-	}()
-
-	log.Printf("[server] distributed-kv-store starting on %s", addr)
-	if err := server.Start(); err != nil {
-		log.Fatalf("[server] fatal: %v", err)
-	}
-	log.Println("[server] stopped")
+	mu       sync.Mutex // protects listener
+	listener net.Listener
 }
 
-func env(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+// New creates a Server. Pass nil for w or r to disable WAL/replication.
+func New(addr string, store *storage.Store, w *wal.WAL, r *replication.Replicator) *Server {
+	return &Server{addr: addr, store: store, wal: w, replicator: r}
+}
+
+// Start begins listening for connections. Blocks until Shutdown is called.
+func (s *Server) Start() error {
+	ln, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("tcp listen on %s: %w", s.addr, err)
 	}
-	return fallback
+
+	s.mu.Lock()
+	s.listener = ln
+	s.mu.Unlock()
+
+	log.Printf("[server] listening on %s", s.addr)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return nil
+		}
+		go s.handleConn(conn)
+	}
+}
+
+// Shutdown closes the listener, unblocking Start.
+func (s *Server) Shutdown() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listener != nil {
+		s.listener.Close()
+	}
+}
+
+func (s *Server) handleConn(conn net.Conn) {
+	defer conn.Close()
+	remote := conn.RemoteAddr().String()
+	log.Printf("[server] client connected: %s", remote)
+
+	reader := bufio.NewReader(conn)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("[server] read error from %s: %v", remote, err)
+			}
+			break
+		}
+		cmd, err := protocol.Parse(line)
+		if err != nil {
+			fmt.Fprint(conn, protocol.Err("empty command"))
+			continue
+		}
+		fmt.Fprint(conn, s.dispatch(cmd))
+	}
+	log.Printf("[server] client disconnected: %s", remote)
+}
+
+func (s *Server) dispatch(cmd *protocol.Command) string {
+	switch cmd.Name {
+
+	case "PING":
+		return protocol.OK("PONG")
+
+	case "SET":
+		if len(cmd.Args) < 2 {
+			return protocol.Err("SET requires key and value")
+		}
+		key, value := cmd.Args[0], cmd.Args[1]
+		entry := wal.Entry{Op: "SET", Key: key, Value: value}
+
+		if len(cmd.Args) >= 4 {
+			modifier := strings.ToUpper(cmd.Args[2])
+			switch modifier {
+			case "EX":
+				secs, err := strconv.Atoi(cmd.Args[3])
+				if err != nil || secs <= 0 {
+					return protocol.Err("EX requires a positive integer")
+				}
+				entry.HasTTL = true
+				entry.ExpiresAt = time.Now().Add(time.Duration(secs) * time.Second)
+			case "EXAT":
+				ns, err := strconv.ParseInt(cmd.Args[3], 10, 64)
+				if err != nil {
+					return protocol.Err("EXAT requires a nanosecond timestamp")
+				}
+				entry.HasTTL = true
+				entry.ExpiresAt = time.Unix(0, ns)
+			default:
+				return protocol.Err(fmt.Sprintf("unknown SET option %q", cmd.Args[2]))
+			}
+		}
+
+		if s.wal != nil {
+			if err := s.wal.Append(entry); err != nil {
+				log.Printf("[server] WAL append error: %v", err)
+				return protocol.Err("internal error: persistence failed")
+			}
+		}
+
+		if entry.HasTTL {
+			s.store.SetWithExpiry(key, value, entry.ExpiresAt)
+		} else {
+			s.store.Set(key, value)
+		}
+
+		if s.replicator != nil {
+			var replicaCmd string
+			if entry.HasTTL {
+				replicaCmd = fmt.Sprintf("SET %s %s EXAT %d", key, value, entry.ExpiresAt.UnixNano())
+			} else {
+				replicaCmd = fmt.Sprintf("SET %s %s", key, value)
+			}
+			s.replicator.Replicate(replicaCmd)
+		}
+		return protocol.OK("OK")
+
+	case "GET":
+		if len(cmd.Args) < 1 {
+			return protocol.Err("GET requires a key")
+		}
+		val, ok := s.store.Get(cmd.Args[0])
+		if !ok {
+			return protocol.Err("key not found")
+		}
+		return protocol.OK(val)
+
+	case "DEL":
+		if len(cmd.Args) < 1 {
+			return protocol.Err("DEL requires a key")
+		}
+		if s.wal != nil {
+			entry := wal.Entry{Op: "DEL", Key: cmd.Args[0]}
+			if err := s.wal.Append(entry); err != nil {
+				log.Printf("[server] WAL append error: %v", err)
+				return protocol.Err("internal error: persistence failed")
+			}
+		}
+		if !s.store.Delete(cmd.Args[0]) {
+			return protocol.Err("key not found")
+		}
+		if s.replicator != nil {
+			s.replicator.Replicate(fmt.Sprintf("DEL %s", cmd.Args[0]))
+		}
+		return protocol.OK("OK")
+
+	default:
+		return protocol.Err(fmt.Sprintf("unknown command %q", cmd.Name))
+	}
 }
