@@ -34,7 +34,7 @@ type Cluster struct {
 func New() *Cluster {
 	return &Cluster{
 		ring:   hashing.New(hashing.DefaultReplicas),
-		health: newHealthTracker(DefaultMissThreshold),
+		health: NewHealthTracker(DefaultMissThreshold),
 	}
 }
 

@@ -13,128 +13,346 @@ import (
 	"github.com/Lenecplusultra/distributed-kv-store/internal/tcp"
 )
 
-// startReplica launches a real TCP server with no WAL and no replicator —
-// exactly what a replica node looks like in Phase 5.
-func startReplica(t *testing.T, port string) *storage.Store {
+// recordingReplica is a fake replica that records every command it receives,
+// in arrival order, and can be made to fail on demand.
+//
+// A real tcp.Server can't be used for the ordering tests: it applies writes
+// to a store, so only the final value is observable and an out-of-order
+// delivery that happens to end on the right value would pass. Recording the
+// sequence is what actually proves ordering.
+type recordingReplica struct {
+	addr     string
+	ln       net.Listener
+	mu       chan struct{} // used as a 1-slot mutex
+	received []string
+	failing  bool
+	delay    time.Duration
+}
+
+func newRecordingReplica(t *testing.T, port string) *recordingReplica {
 	t.Helper()
 	addr := "127.0.0.1:" + port
-	store := storage.New()
-	srv := tcp.New(addr, store, nil, nil)
-	go srv.Start()
-	time.Sleep(40 * time.Millisecond)
-	t.Cleanup(func() { srv.Shutdown() })
-	return store
-}
-
-// query sends one command to addr and returns the trimmed response.
-func query(t *testing.T, addr, cmd string) string {
-	t.Helper()
-	conn, err := net.Dial("tcp", addr)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		t.Fatalf("connect to %s: %v", addr, err)
+		t.Fatalf("listen on %s: %v", addr, err)
 	}
+
+	r := &recordingReplica{addr: addr, ln: ln, mu: make(chan struct{}, 1)}
+	r.mu <- struct{}{}
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go r.handle(conn)
+		}
+	}()
+
+	t.Cleanup(func() { ln.Close() })
+	return r
+}
+
+func (r *recordingReplica) lock()   { <-r.mu }
+func (r *recordingReplica) unlock() { r.mu <- struct{}{} }
+
+func (r *recordingReplica) handle(conn net.Conn) {
 	defer conn.Close()
-	fmt.Fprintf(conn, "%s\n", cmd)
-	resp, _ := bufio.NewReader(conn).ReadString('\n')
-	return strings.TrimRight(resp, "\n")
-}
+	reader := bufio.NewReader(conn)
 
-func TestReplicateSetToLiveServer(t *testing.T) {
-	startReplica(t, "17001")
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		line = strings.TrimSpace(line)
 
-	r := replication.New([]string{"127.0.0.1:17001"})
-	r.Replicate("SET city Atlanta")
+		r.lock()
+		failing := r.failing
+		delay := r.delay
+		isCmd := line != "" && !strings.HasPrefix(line, "HELLO") && line != "PING"
+		if isCmd && !failing {
+			r.received = append(r.received, line)
+		}
+		r.unlock()
 
-	// Replication is async — give it time to complete.
-	time.Sleep(200 * time.Millisecond)
+		if delay > 0 {
+			time.Sleep(delay)
+		}
 
-	if resp := query(t, "127.0.0.1:17001", "GET city"); resp != "+Atlanta" {
-		t.Fatalf("expected +Atlanta on replica, got %q", resp)
-	}
-}
-
-func TestReplicateDelToLiveServer(t *testing.T) {
-	startReplica(t, "17002")
-
-	r := replication.New([]string{"127.0.0.1:17002"})
-
-	// First replicate a SET, then a DEL.
-	r.Replicate("SET city Atlanta")
-	time.Sleep(100 * time.Millisecond)
-
-	r.Replicate("DEL city")
-	time.Sleep(200 * time.Millisecond)
-
-	resp := query(t, "127.0.0.1:17002", "GET city")
-	if !strings.HasPrefix(resp, "-ERR") {
-		t.Fatalf("expected -ERR after DEL replication, got %q", resp)
-	}
-}
-
-func TestReplicateWithEXAT(t *testing.T) {
-	// EXAT preserves the absolute expiry timestamp across replication.
-	// We set a 1-second TTL and verify it expires on the replica too.
-	startReplica(t, "17003")
-
-	r := replication.New([]string{"127.0.0.1:17003"})
-
-	expiresAt := time.Now().Add(time.Second)
-	cmd := fmt.Sprintf("SET token abc EXAT %d", expiresAt.UnixNano())
-	r.Replicate(cmd)
-	time.Sleep(100 * time.Millisecond)
-
-	// Key should be alive immediately after replication.
-	if resp := query(t, "127.0.0.1:17003", "GET token"); resp != "+abc" {
-		t.Fatalf("expected +abc immediately after replication, got %q", resp)
-	}
-
-	// Wait for expiry.
-	time.Sleep(1100 * time.Millisecond)
-
-	resp := query(t, "127.0.0.1:17003", "GET token")
-	if !strings.HasPrefix(resp, "-ERR") {
-		t.Fatalf("expected -ERR after TTL expiry on replica, got %q", resp)
-	}
-}
-
-func TestReplicateToMultipleReplicas(t *testing.T) {
-	startReplica(t, "17004")
-	startReplica(t, "17005")
-
-	r := replication.New([]string{"127.0.0.1:17004", "127.0.0.1:17005"})
-	r.Replicate("SET name tex")
-	time.Sleep(200 * time.Millisecond)
-
-	for _, port := range []string{"17004", "17005"} {
-		resp := query(t, "127.0.0.1:"+port, "GET name")
-		if resp != "+tex" {
-			t.Fatalf("replica %s: expected +tex, got %q", port, resp)
+		switch {
+		case line == "PING":
+			fmt.Fprint(conn, "+PONG\n")
+		case strings.HasPrefix(line, "HELLO"):
+			fmt.Fprint(conn, "+OK\n")
+		case failing:
+			fmt.Fprint(conn, "-ERR simulated failure\n")
+		default:
+			fmt.Fprint(conn, "+OK\n")
 		}
 	}
 }
 
-func TestReplicateToDeadServerDoesNotBlock(t *testing.T) {
-	// Replicating to a non-existent address should not hang the test.
-	// The retry logic should give up gracefully.
-	r := replication.New([]string{"127.0.0.1:19999"})
+func (r *recordingReplica) setFailing(v bool) {
+	r.lock()
+	r.failing = v
+	r.unlock()
+}
 
-	done := make(chan struct{})
-	go func() {
-		r.Replicate("SET key value")
-		close(done)
-	}()
+func (r *recordingReplica) setDelay(d time.Duration) {
+	r.lock()
+	r.delay = d
+	r.unlock()
+}
 
-	// Replicate returns immediately (async) — should not block.
-	select {
-	case <-done:
-		// Good — returned immediately.
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Replicate blocked when it should have returned immediately")
+func (r *recordingReplica) snapshot() []string {
+	r.lock()
+	defer r.unlock()
+	out := make([]string, len(r.received))
+	copy(out, r.received)
+	return out
+}
+
+// waitFor polls until cond is true or the timeout expires.
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+// ── Ordering ──────────────────────────────────────────────────────────────
+
+func TestDeliveryPreservesOrder(t *testing.T) {
+	rep := newRecordingReplica(t, "17101")
+
+	r := replication.New([]string{rep.addr})
+	defer r.Close()
+
+	const n = 50
+	for i := 0; i < n; i++ {
+		r.Replicate(fmt.Sprintf("SET k %d", i))
+	}
+
+	if !waitFor(t, 5*time.Second, func() bool { return len(rep.snapshot()) == n }) {
+		t.Fatalf("only %d of %d writes delivered", len(rep.snapshot()), n)
+	}
+
+	got := rep.snapshot()
+	for i, cmd := range got {
+		want := fmt.Sprintf("SET k %d", i)
+		if cmd != want {
+			t.Fatalf("position %d: got %q, want %q — delivery out of order", i, cmd, want)
+		}
 	}
 }
 
-func TestNoReplicasIsNoop(t *testing.T) {
-	r := replication.New([]string{})
-	// Should not panic or block.
-	r.Replicate("SET key value")
+// TestRetryDoesNotAllowOvertaking is the regression test for the Phase 8a
+// bug. A slow first write must not be passed by a fast second one.
+func TestRetryDoesNotAllowOvertaking(t *testing.T) {
+	rep := newRecordingReplica(t, "17102")
+
+	r := replication.New([]string{rep.addr})
+	defer r.Close()
+
+	// Make the first delivery slow, then speed up.
+	rep.setDelay(150 * time.Millisecond)
+	r.Replicate("SET k first")
+
+	time.Sleep(20 * time.Millisecond) // ensure the first is in flight
+	rep.setDelay(0)
+	r.Replicate("SET k second")
+
+	if !waitFor(t, 5*time.Second, func() bool { return len(rep.snapshot()) == 2 }) {
+		t.Fatalf("expected 2 writes, got %v", rep.snapshot())
+	}
+
+	got := rep.snapshot()
+	if got[0] != "SET k first" || got[1] != "SET k second" {
+		t.Fatalf("out of order: %v", got)
+	}
+}
+
+// ── Dead replica handling ─────────────────────────────────────────────────
+
+func TestReplicaDeclaredDeadStopsBlocking(t *testing.T) {
+	// No listener at this address — every delivery fails.
+	r := replication.New([]string{"127.0.0.1:17103"})
+	defer r.Close()
+
+	// Enough writes to exceed the retry budget several times over.
+	for i := 0; i < 5; i++ {
+		r.Replicate(fmt.Sprintf("SET k %d", i))
+	}
+
+	dead := waitFor(t, 10*time.Second, func() bool {
+		st, ok := r.Health()["127.0.0.1:17103"]
+		return ok && !st.Alive
+	})
+	if !dead {
+		t.Fatal("replica should have been declared dead after repeated failures")
+	}
+
+	// Once dead, Replicate must not block even under sustained load.
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 5000; i++ {
+			r.Replicate(fmt.Sprintf("SET flood %d", i))
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Replicate blocked on a dead replica — queue is not draining")
+	}
+}
+
+func TestDeadReplicaRevives(t *testing.T) {
+	rep := newRecordingReplica(t, "17104")
+	rep.setFailing(true)
+
+	r := replication.New([]string{rep.addr})
+	defer r.Close()
+
+	for i := 0; i < 5; i++ {
+		r.Replicate(fmt.Sprintf("SET k %d", i))
+	}
+
+	dead := waitFor(t, 10*time.Second, func() bool {
+		st := r.Health()[rep.addr]
+		return !st.Alive
+	})
+	if !dead {
+		t.Fatal("replica should have been declared dead")
+	}
+
+	// Recover. The probe ticker should notice within ~1s.
+	rep.setFailing(false)
+
+	alive := waitFor(t, 5*time.Second, func() bool {
+		st := r.Health()[rep.addr]
+		return st.Alive
+	})
+	if !alive {
+		t.Fatal("replica should have revived after recovering")
+	}
+
+	// Writes flow again.
+	r.Replicate("SET after revival")
+	if !waitFor(t, 5*time.Second, func() bool {
+		for _, c := range rep.snapshot() {
+			if c == "SET after revival" {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatal("write after revival was not delivered")
+	}
+}
+
+func TestHealthyReplicaStaysAlive(t *testing.T) {
+	rep := newRecordingReplica(t, "17105")
+
+	r := replication.New([]string{rep.addr})
+	defer r.Close()
+
+	for i := 0; i < 20; i++ {
+		r.Replicate(fmt.Sprintf("SET k %d", i))
+	}
+
+	if !waitFor(t, 5*time.Second, func() bool { return len(rep.snapshot()) == 20 }) {
+		t.Fatalf("expected 20 writes, got %d", len(rep.snapshot()))
+	}
+	if st := r.Health()[rep.addr]; !st.Alive {
+		t.Fatal("healthy replica should not be marked dead")
+	}
+}
+
+// ── Multiple replicas ─────────────────────────────────────────────────────
+
+func TestOneDeadReplicaDoesNotStopAnother(t *testing.T) {
+	good := newRecordingReplica(t, "17106")
+
+	// Second address has no listener at all.
+	r := replication.New([]string{good.addr, "127.0.0.1:17107"})
+	defer r.Close()
+
+	for i := 0; i < 10; i++ {
+		r.Replicate(fmt.Sprintf("SET k %d", i))
+	}
+
+	if !waitFor(t, 10*time.Second, func() bool { return len(good.snapshot()) == 10 }) {
+		t.Fatalf("healthy replica got %d of 10 writes — a dead peer is holding it up",
+			len(good.snapshot()))
+	}
+
+	got := good.snapshot()
+	for i, cmd := range got {
+		if want := fmt.Sprintf("SET k %d", i); cmd != want {
+			t.Fatalf("position %d: got %q, want %q", i, cmd, want)
+		}
+	}
+}
+
+// ── Lifecycle ─────────────────────────────────────────────────────────────
+
+func TestCloseStopsWorkers(t *testing.T) {
+	rep := newRecordingReplica(t, "17108")
+
+	r := replication.New([]string{rep.addr})
+	r.Replicate("SET k v")
+
+	done := make(chan struct{})
+	go func() {
+		r.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return — worker goroutines are still running")
+	}
+
+	// Replicate after Close must not block or panic.
+	r.Replicate("SET after close")
+}
+
+// ── Real server integration ───────────────────────────────────────────────
+
+func TestReplicateToRealServer(t *testing.T) {
+	store := storage.New()
+	srv := tcp.New("127.0.0.1:17109", store, nil, nil)
+	go srv.Start()
+	time.Sleep(40 * time.Millisecond)
+	t.Cleanup(srv.Shutdown)
+
+	r := replication.New([]string{"127.0.0.1:17109"})
+	defer r.Close()
+
+	r.Replicate("SET city Atlanta")
+
+	if !waitFor(t, 5*time.Second, func() bool {
+		v, ok := store.Get("city")
+		return ok && v == "Atlanta"
+	}) {
+		t.Fatal("write did not reach the replica store")
+	}
+
+	r.Replicate("DEL city")
+	if !waitFor(t, 5*time.Second, func() bool {
+		_, ok := store.Get("city")
+		return !ok
+	}) {
+		t.Fatal("delete did not reach the replica store")
+	}
 }

@@ -3,125 +3,264 @@
 //
 // # Model
 //
-// This is asynchronous replication: the primary writes to its local store
-// and WAL, returns +OK to the client immediately, then replicates in the
-// background. The client never waits for replicas to confirm.
+// Asynchronous: the primary writes to its local store and WAL, returns +OK
+// to the client immediately, then replicates in the background. The client
+// does not wait for replicas to confirm.
 //
-// Tradeoff: if the primary crashes after returning +OK but before
-// replication completes, that write is lost on the replicas. Redis makes
-// the same tradeoff in its default configuration.
+// # Ordering (Phase 8a)
 //
-// # Retry policy
+// Each replica has one persistent goroutine draining an ordered channel, so
+// writes reach a given replica in the order the primary accepted them.
 //
-// Each replica gets its own goroutine. Failed sends are retried with
-// exponential backoff up to maxRetries times. After that, the write
-// is dropped and the replica is left stale. Recovery requires a full
-// manual resync — there is no replication offset tracking.
+// The previous design spawned a goroutine per replica per command, each with
+// its own retry timers. Two rapid writes to the same key could land out of
+// order: if the first needed a backoff retry and the second succeeded
+// immediately, the replica kept the older value. That is write divergence,
+// not replication lag — no amount of waiting repairs it.
 //
-// # Known ordering hazard
+// Retries now run inside the replica's own goroutine, so a backoff holds
+// that replica's queue instead of letting the next write overtake it.
+// Ordering follows from the structure rather than from timing.
 //
-// Replicate spawns a goroutine per replica per command, and each goroutine
-// runs its own independent retry timers. Two rapid writes to the same key
-// can therefore land out of order: if the first send needs a backoff retry
-// and the second succeeds immediately, the replica ends up holding the older
-// value. This is write divergence, not merely replication lag. The fix is a
-// persistent per-replica goroutine draining an ordered channel, which is
-// deferred and tracked separately.
+// # Backpressure, and why blocking beats dropping
+//
+// Queues are bounded. When a replica's queue fills, Replicate blocks the
+// calling client write until space frees.
+//
+// Blocking is chosen because this system has no replication offset tracking:
+// a dropped write is unrecoverable and, worse, undetectable. A replica that
+// silently missed write #4000 is indistinguishable from one that is merely
+// behind. Redis can afford to drop — it kills a replica connection that
+// exceeds its output buffer limit, and the replica full-resyncs on reconnect
+// — but that recovery path does not exist here.
+//
+// The cost is real: blocking converts a durability problem into an
+// availability problem, and one dead replica would otherwise stall the
+// primary's write path for every client.
+//
+// # The escape hatch
+//
+// That stall is bounded by failure detection, reusing cluster.HealthTracker
+// — the same component and the same threshold that decides whether a node
+// stays in the hash ring. The signal differs: the ring's detector feeds it
+// PING outcomes, while replication feeds it real delivery outcomes, which is
+// the more direct evidence of whether writes can land.
+//
+// After DefaultMissThreshold consecutive delivery failures a replica is
+// declared dead. Its queue then drains without blocking and writes are
+// dropped — each one logged individually, so the divergence is announced
+// rather than silent. A background PING returns it to service.
+//
+// So: block while the replica is plausibly alive, drop once it is formally
+// dead. Bounded degradation instead of an unbounded stall. A revived replica
+// is stale and needs a resync; that is logged too.
 //
 // # Why EXAT instead of EX for TTL replication
 //
-// The primary converts client-facing EX <seconds> to an absolute
-// nanosecond timestamp (EXAT) before replicating. If it sent EX 60
-// and replication took 2 seconds, the replica would give the key
-// 60 more seconds instead of the remaining 58. Absolute timestamps
-// survive the replication delay correctly.
+// The primary converts client-facing EX <seconds> to an absolute nanosecond
+// timestamp before replicating. Sending EX 60 after two seconds of lag would
+// give the replica 60 more seconds instead of the remaining 58. Absolute
+// timestamps survive the delay.
 package replication
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log"
 	"net"
+	"strings"
+	"sync"
 	"time"
+
+	"github.com/Lenecplusultra/distributed-kv-store/internal/cluster"
 )
 
 const (
 	DefaultMaxRetries = 3
 	DefaultTimeout    = 2 * time.Second
 
+	// DefaultQueueSize bounds pending writes per replica. Large enough to
+	// absorb a brief stall, small enough that a genuinely dead replica
+	// reaches the death threshold rather than buffering unboundedly.
+	DefaultQueueSize = 1000
+
+	// DefaultProbeInterval is how often a dead replica is probed for revival.
+	DefaultProbeInterval = time.Second
+
 	// replicaHello identifies this connection to the receiving node as
-	// replication traffic rather than client traffic, so the receiver's rate
-	// limiter exempts it.
+	// replication traffic, so the receiver's rate limiter exempts it.
+	// Without it, enabling RATE_LIMIT on a replica would throttle inbound
+	// replication and drop writes.
 	//
-	// Without this, enabling RATE_LIMIT on a node that also serves as a
-	// replica would throttle inbound replication. Throttled writes burn all
-	// three retries and are then dropped permanently — silent divergence
-	// with no error surfaced to any client.
-	//
-	// Cost: one extra request/response round trip per replicated command,
-	// because the connection is not reused. Connection pooling in Phase 8
-	// amortises the handshake across many commands.
-	//
-	// This is forgeable — any client can claim the replica prefix. It is a
-	// trusted-network assumption, consistent with the fact that the
-	// replication path has no authentication at all.
+	// Forgeable by any client — a trusted-network assumption, consistent
+	// with the replication path having no authentication at all.
 	replicaHello = "HELLO replica:primary"
 )
 
-// Replicator sends write commands to a fixed set of replica addresses.
+// Replicator sends write commands to a fixed set of replica addresses,
+// preserving per-replica ordering.
 type Replicator struct {
-	replicas   []string
-	maxRetries int
-	timeout    time.Duration
+	replicas []string
+	queues   map[string]chan string
+	health   *cluster.HealthTracker
+
+	maxRetries    int
+	timeout       time.Duration
+	probeInterval time.Duration
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
-// New creates a Replicator targeting the given replica addresses.
+// New creates a Replicator targeting the given replica addresses and starts
+// one worker goroutine per replica. Call Close to stop them.
 func New(replicas []string) *Replicator {
-	return &Replicator{
-		replicas:   replicas,
-		maxRetries: DefaultMaxRetries,
-		timeout:    DefaultTimeout,
+	ctx, cancel := context.WithCancel(context.Background())
+
+	r := &Replicator{
+		replicas: replicas,
+		queues:   make(map[string]chan string, len(replicas)),
+		// The replica set is fixed at construction, so every address is
+		// registered up front and none are ever added or removed.
+		health:        cluster.NewHealthTracker(cluster.DefaultMissThreshold, replicas...),
+		maxRetries:    DefaultMaxRetries,
+		timeout:       DefaultTimeout,
+		probeInterval: DefaultProbeInterval,
+		ctx:           ctx,
+		cancel:        cancel,
 	}
+
+	for _, addr := range replicas {
+		q := make(chan string, DefaultQueueSize)
+		r.queues[addr] = q
+
+		r.wg.Add(1)
+		go func(addr string, q chan string) {
+			defer r.wg.Done()
+			r.worker(addr, q)
+		}(addr, q)
+	}
+
+	return r
 }
 
 // Replicas returns the configured replica addresses.
 func (r *Replicator) Replicas() []string { return r.replicas }
 
-// Replicate sends cmd to all replicas asynchronously.
-// Returns immediately — each replica gets its own goroutine.
-// cmd should be a fully-formed protocol command, e.g.:
+// Health returns a snapshot of replica delivery health, for observability.
+func (r *Replicator) Health() map[string]cluster.NodeStatus {
+	return r.health.Status()
+}
+
+// Replicate enqueues cmd for every replica.
+//
+// Normally returns immediately. If a replica's queue is full, this blocks
+// until that replica drains or is declared dead — see the package comment.
+//
+// cmd should be a fully-formed protocol command:
 //
 //	"SET key value"
 //	"SET key value EXAT 1753000000000000000"
 //	"DEL key"
 func (r *Replicator) Replicate(cmd string) {
 	for _, addr := range r.replicas {
-		go r.sendWithRetry(addr, cmd)
+		select {
+		case r.queues[addr] <- cmd:
+		case <-r.ctx.Done():
+			// Shutting down — stop enqueueing rather than blocking forever
+			// on a queue whose worker has already exited.
+			return
+		}
 	}
 }
 
-// sendWithRetry attempts to deliver cmd to addr with exponential backoff.
-// Logs and gives up after maxRetries failures — replica will be stale.
-func (r *Replicator) sendWithRetry(addr, cmd string) {
+// Close stops all replica workers and waits for them to exit.
+// Queued writes are abandoned.
+func (r *Replicator) Close() {
+	r.cancel()
+	r.wg.Wait()
+}
+
+// worker drains one replica's queue sequentially. Being the only goroutine
+// sending to this replica is what makes delivery order match enqueue order.
+func (r *Replicator) worker(addr string, q chan string) {
+	probe := time.NewTicker(r.probeInterval)
+	defer probe.Stop()
+
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+
+		case <-probe.C:
+			// Only meaningful while dead. Revival is checked with a cheap
+			// PING rather than by attempting a real write, so a dead
+			// replica's queue never stalls on dial timeouts.
+			if r.health.IsAlive(addr) {
+				continue
+			}
+			if err := ping(addr, r.timeout); err == nil {
+				if r.health.Beat(addr) {
+					log.Printf("[replication] replica %s revived — resuming delivery "+
+						"(it is stale and needs a resync)", addr)
+				}
+			}
+
+		case cmd := <-q:
+			if !r.health.IsAlive(addr) {
+				// Drop, but never silently. Each dropped write is a known
+				// divergence — which is exactly what we refuse to do while
+				// the replica is merely slow.
+				log.Printf("[replication] replica %s is dead — dropping %q", addr, cmd)
+				continue
+			}
+
+			if err := r.sendWithRetry(addr, cmd); err != nil {
+				log.Printf("[replication] delivery to %s failed: %v", addr, err)
+
+				if r.health.Miss(addr) {
+					log.Printf("[replication] replica %s declared dead after %d consecutive "+
+						"delivery failures — queue will drain without blocking, writes dropped",
+						addr, cluster.DefaultMissThreshold)
+				}
+				continue
+			}
+
+			r.health.Beat(addr)
+		}
+	}
+}
+
+// sendWithRetry attempts delivery with exponential backoff. Runs inside the
+// replica's worker, so retries hold that replica's queue and cannot be
+// overtaken by a later write.
+func (r *Replicator) sendWithRetry(addr, cmd string) error {
 	backoff := 100 * time.Millisecond
+	var lastErr error
+
 	for attempt := 1; attempt <= r.maxRetries; attempt++ {
 		if err := r.send(addr, cmd); err == nil {
-			return // success
+			return nil
 		} else {
-			log.Printf("[replication] attempt %d/%d → %s failed: %v",
-				attempt, r.maxRetries, addr, err)
+			lastErr = err
 		}
+
 		if attempt < r.maxRetries {
-			time.Sleep(backoff)
+			select {
+			case <-time.After(backoff):
+			case <-r.ctx.Done():
+				return fmt.Errorf("shutting down: %w", lastErr)
+			}
 			backoff *= 2 // 100ms → 200ms → 400ms
 		}
 	}
-	log.Printf("[replication] giving up on %s for %q — replica may be stale", addr, cmd)
+	return lastErr
 }
 
-// send opens a TCP connection to addr, identifies as a replica, writes cmd,
-// and reads one response. The connection is closed after each command —
-// simple and correct for now. Connection pooling is a Phase 8 optimisation.
+// send opens a connection, identifies as replication traffic, writes cmd,
+// and reads the response. One connection per command — pooling is Phase 8b.
 func (r *Replicator) send(addr, cmd string) error {
 	conn, err := net.DialTimeout("tcp", addr, r.timeout)
 	if err != nil {
@@ -132,7 +271,6 @@ func (r *Replicator) send(addr, cmd string) error {
 
 	reader := bufio.NewReader(conn)
 
-	// Identify as replication traffic before sending the write.
 	if _, err := fmt.Fprintf(conn, "%s\n", replicaHello); err != nil {
 		return fmt.Errorf("handshake write to %s: %w", addr, err)
 	}
@@ -140,13 +278,11 @@ func (r *Replicator) send(addr, cmd string) error {
 	if err != nil {
 		return fmt.Errorf("handshake read from %s: %w", addr, err)
 	}
-	if len(helloResp) > 0 && helloResp[0] == '-' {
-		// An older node that predates HELLO will reject it as an unknown
-		// command. That is not fatal — the write below still applies. It
-		// only means this connection is subject to that node's rate limiter,
-		// if it has one.
-		log.Printf("[replication] %s rejected handshake (%s) — proceeding unexempted",
-			addr, helloResp[:len(helloResp)-1])
+	if strings.HasPrefix(helloResp, "-") {
+		// A node predating HELLO rejects it as unknown. Not fatal — the
+		// write below still applies; this connection is simply subject to
+		// that node's rate limiter, if it has one.
+		log.Printf("[replication] %s rejected handshake — proceeding unexempted", addr)
 	}
 
 	if _, err := fmt.Fprintf(conn, "%s\n", cmd); err != nil {
@@ -157,8 +293,30 @@ func (r *Replicator) send(addr, cmd string) error {
 	if err != nil {
 		return fmt.Errorf("read from %s: %w", addr, err)
 	}
-	if len(resp) > 0 && resp[0] == '-' {
-		return fmt.Errorf("replica %s returned error: %s", addr, resp)
+	if strings.HasPrefix(resp, "-") {
+		return fmt.Errorf("replica %s returned error: %s", addr, strings.TrimSpace(resp))
+	}
+	return nil
+}
+
+// ping checks whether a dead replica has come back, without sending a write.
+func ping(addr string, timeout time.Duration) error {
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(timeout))
+
+	if _, err := fmt.Fprintf(conn, "PING\n"); err != nil {
+		return err
+	}
+	resp, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(resp, "+PONG") {
+		return fmt.Errorf("unexpected response from %s: %q", addr, strings.TrimSpace(resp))
 	}
 	return nil
 }

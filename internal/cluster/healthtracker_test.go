@@ -8,7 +8,7 @@ import (
 // Note: testing internal (unexported) types directly from within the package.
 
 func newTracker() *HealthTracker {
-	return newHealthTracker(3)
+	return NewHealthTracker(3)
 }
 
 func TestRegisterIsAlive(t *testing.T) {

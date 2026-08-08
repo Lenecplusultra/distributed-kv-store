@@ -18,6 +18,20 @@
 //
 // This is the same model Kubernetes uses for liveness probes
 // (failureThreshold: 3) and how most production failure detectors work.
+//
+// # Two callers, one definition of "dead" (Phase 8a)
+//
+// HealthTracker is used by two independent subsystems:
+//
+//   - Cluster's failure detector, which asks "should this node stay in the
+//     hash ring?" and feeds the tracker PING outcomes.
+//   - The Replicator, which asks "can I deliver writes to this replica?" and
+//     feeds it actual delivery outcomes.
+//
+// Different questions, same mechanism — and deliberately the same threshold,
+// so "dead" means one thing in this system rather than two things that can
+// drift apart. The tracker itself stays ignorant of both: it records
+// outcomes and reports edges, and each caller decides what to do about them.
 package cluster
 
 import (
@@ -46,7 +60,7 @@ type NodeStatus struct {
 
 // HealthTracker records heartbeat outcomes per node.
 // It is goroutine-safe and has no knowledge of the ring —
-// it only tracks health state. The Cluster decides what to do
+// it only tracks health state. The caller decides what to do
 // when a node dies or revives.
 type HealthTracker struct {
 	mu            sync.RWMutex
@@ -54,13 +68,23 @@ type HealthTracker struct {
 	missThreshold int
 }
 
-// newHealthTracker creates a HealthTracker that declares nodes dead
-// after missThreshold consecutive missed heartbeats.
-func newHealthTracker(missThreshold int) *HealthTracker {
-	return &HealthTracker{
-		nodes:         make(map[string]*nodeHealth),
+// NewHealthTracker creates a HealthTracker that declares nodes dead after
+// missThreshold consecutive missed heartbeats, pre-registering addrs.
+//
+// The variadic addrs exist so callers outside this package can build a
+// tracker over a fixed, known set of nodes without needing register to be
+// exported. Cluster passes none and registers dynamically as nodes join the
+// ring; the Replicator passes its full replica list up front, since that set
+// never changes at runtime.
+func NewHealthTracker(missThreshold int, addrs ...string) *HealthTracker {
+	h := &HealthTracker{
+		nodes:         make(map[string]*nodeHealth, len(addrs)),
 		missThreshold: missThreshold,
 	}
+	for _, addr := range addrs {
+		h.register(addr)
+	}
+	return h
 }
 
 // register adds addr to the tracker in the alive state.
