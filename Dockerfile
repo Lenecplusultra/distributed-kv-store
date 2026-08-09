@@ -55,6 +55,17 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # CI, so a broken image cannot be built at all.
 RUN test -x /out/server && test -x /out/client && test -x /out/bench
 
+# Create the WAL directory here, owned by the uid the runtime stage runs as.
+#
+# This has to happen in the builder because distroless has no shell — there
+# is no `RUN mkdir` or `chown` available in the runtime stage. Docker creates
+# a volume mount point owned by root by default, so without this the
+# unprivileged process cannot open its own log and the container crash-loops
+# with "permission denied".
+#
+# 65532 is the uid/gid of distroless's `nonroot` user.
+RUN mkdir -p /data && chown 65532:65532 /data
+
 # ── Runtime stage ─────────────────────────────────────────────────────────
 FROM gcr.io/distroless/static-debian12:nonroot
 
@@ -66,6 +77,9 @@ USER nonroot:nonroot
 COPY --from=builder /out/server /server
 COPY --from=builder /out/client /client
 COPY --from=builder /out/bench /bench
+
+# Bring the pre-chowned directory across.
+COPY --from=builder --chown=65532:65532 /data /data
 
 # WAL lives here. Mounted as a volume in compose and as a PVC in Kubernetes,
 # so it survives container restarts.

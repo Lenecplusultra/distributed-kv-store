@@ -35,6 +35,11 @@
 
 services:
   kv-primary:
+    # Only this service declares a build. All three run the same image, and
+    # if each one also declared `build:` Compose would build them in
+    # parallel and they would race to claim the same tag — the loser fails
+    # with "image already exists". Build once here; the replicas reference
+    # the result.
     build:
       context: .
       dockerfile: Dockerfile
@@ -61,9 +66,6 @@ services:
       - primary-data:/data
     networks:
       - kv-net
-    depends_on:
-      - kv-replica-1
-      - kv-replica-2
     restart: unless-stopped
     # No healthcheck here. Compose healthchecks run a command inside the
     # container, and distroless has no shell, no curl, and no wget. The
@@ -73,9 +75,6 @@ services:
     # deployments/kubernetes/statefulset.yaml.
 
   kv-replica-1:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: distributed-kv-store:latest
     container_name: kv-replica-1
     ports:
@@ -91,12 +90,16 @@ services:
       - replica1-data:/data
     networks:
       - kv-net
+    # Waits for the primary only so the image exists before this starts.
+    # Startup order does not otherwise matter: if a replica is not yet
+    # listening, the primary's replicator retries with backoff and, after
+    # three consecutive failures, marks it dead and probes for revival.
+    # The cluster converges regardless of boot order.
+    depends_on:
+      - kv-primary
     restart: unless-stopped
 
   kv-replica-2:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: distributed-kv-store:latest
     container_name: kv-replica-2
     ports:
@@ -111,12 +114,20 @@ services:
       - replica2-data:/data
     networks:
       - kv-net
+    depends_on:
+      - kv-primary
     restart: unless-stopped
 
 volumes:
   # Named volumes so each node's WAL survives container restarts, and so
   # nodes never share a log file. Three nodes appending to one file would
   # reproduce the Phase 8e failure at the filesystem level.
+  #
+  # Docker seeds an empty named volume from the image's contents at that
+  # path, including ownership — which is why /data is created and chowned to
+  # 65532 in the Dockerfile. Without that the mount point belongs to root,
+  # the unprivileged process cannot open its WAL, and every node
+  # crash-loops on "permission denied".
   primary-data:
   replica1-data:
   replica2-data:
