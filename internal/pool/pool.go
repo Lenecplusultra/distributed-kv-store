@@ -56,7 +56,18 @@ import (
 const (
 	// DefaultMaxIdlePerAddr caps idle connections retained per node.
 	// Beyond this, connections are closed on return rather than pooled.
-	DefaultMaxIdlePerAddr = 8
+	//
+	// This must be at least as large as the number of goroutines using the
+	// pool concurrently, or the pool stops being a pool: every caller beyond
+	// the cap has its connection closed on return and dials a fresh one on
+	// its next call. Under load that produces a TIME_WAIT socket per
+	// operation and eventually exhausts the ephemeral port range, which
+	// surfaces as multi-second dial timeouts rather than as anything
+	// resembling a pooling problem.
+	//
+	// The default suits an interactive client. Concurrent callers should set
+	// WithMaxIdle to their worker count.
+	DefaultMaxIdlePerAddr = 32
 
 	// DefaultDialTimeout bounds connection establishment.
 	DefaultDialTimeout = 2 * time.Second
@@ -94,15 +105,51 @@ type Pool struct {
 	closed bool
 }
 
-// New creates an empty Pool with default settings.
-func New() *Pool {
-	return &Pool{
+// Option configures a Pool.
+type Option func(*Pool)
+
+// WithMaxIdle sets how many idle connections are retained per node.
+//
+// Set this to at least the number of goroutines that will use the pool
+// concurrently. Below that, connections are closed and redialed constantly
+// and the pool actively hurts rather than helps.
+func WithMaxIdle(n int) Option {
+	return func(p *Pool) {
+		if n > 0 {
+			p.maxIdlePerAddr = n
+		}
+	}
+}
+
+// WithIOTimeout bounds a single request/response exchange.
+func WithIOTimeout(d time.Duration) Option {
+	return func(p *Pool) {
+		if d > 0 {
+			p.ioTimeout = d
+		}
+	}
+}
+
+// New creates an empty Pool.
+func New(opts ...Option) *Pool {
+	p := &Pool{
 		idle:           make(map[string][]*conn),
 		maxIdlePerAddr: DefaultMaxIdlePerAddr,
 		dialTimeout:    DefaultDialTimeout,
 		ioTimeout:      DefaultIOTimeout,
 		maxIdleTime:    DefaultMaxIdleTime,
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
+// MaxIdle reports the configured idle cap, for tests and diagnostics.
+func (p *Pool) MaxIdle() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.maxIdlePerAddr
 }
 
 // Do sends cmd to addr and returns the response line, including its trailing

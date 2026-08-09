@@ -3,6 +3,7 @@
 // Configuration is entirely through environment variables:
 //
 //	ADDR          listen address                  (default :6379)
+//	CAPACITY      max keys before LRU eviction    (default unset = unlimited)
 //	METRICS_ADDR  Prometheus endpoint address     (default :9090, "" disables)
 //	WAL_PATH      write-ahead log file            (default data/wal.log)
 //	REPLICAS      comma-separated replica addrs   (default none)
@@ -66,13 +67,16 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := storage.New()
+	store, err := buildStore()
+	if err != nil {
+		log.Fatalf("[server] %v", err)
+	}
 	m := metrics.New()
 
 	// --- WAL: open and recover before accepting any traffic ---
-	w, err := wal.Open(walPath)
-	if err != nil {
-		log.Fatalf("[server] could not open WAL at %s: %v", walPath, err)
+	w, walErr := wal.Open(walPath)
+	if walErr != nil {
+		log.Fatalf("[server] could not open WAL at %s: %v", walPath, walErr)
 	}
 	defer w.Close()
 
@@ -195,6 +199,33 @@ func startMetricsServer(m *metrics.Metrics) *http.Server {
 	}()
 
 	return srv
+}
+
+// buildStore reads CAPACITY and returns either an unlimited store or one
+// with LRU eviction enabled.
+//
+// Unlimited is the default because eviction changes the system's semantics:
+// a key that was written can silently disappear. That is the right tradeoff
+// for a cache and the wrong one for a store of record, so it should be an
+// explicit choice rather than something that happens once a workload grows.
+//
+// Note that WAL replay restores evicted keys, since evictions are not
+// written to the log — memory management is not a client-visible deletion.
+// A node that has evicted heavily will therefore come back with more keys
+// resident than it had before restarting.
+func buildStore() (*storage.Store, error) {
+	raw := os.Getenv("CAPACITY")
+	if raw == "" {
+		return storage.New(), nil
+	}
+
+	capacity, err := strconv.Atoi(raw)
+	if err != nil || capacity < 1 {
+		return nil, fmt.Errorf("invalid CAPACITY %q: must be a positive integer", raw)
+	}
+
+	log.Printf("[server] LRU eviction enabled: capacity %d keys", capacity)
+	return storage.NewWithCapacity(capacity), nil
 }
 
 // buildLimiter reads RATE_LIMIT and BURST, returning nil when rate limiting

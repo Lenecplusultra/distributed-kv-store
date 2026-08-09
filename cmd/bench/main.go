@@ -83,6 +83,7 @@ type sample struct {
 	latency time.Duration
 	isRead  bool
 	failed  bool
+	miss    bool // read that found no key
 }
 
 func main() {
@@ -94,7 +95,11 @@ func main() {
 	}
 	fmt.Printf("target(s): %s\n", strings.Join(targets, ", "))
 
-	p := pool.New()
+	// The idle cap must cover every worker. Below that, each operation
+	// closes its connection on return and dials a new one, which under load
+	// exhausts ephemeral ports and turns the benchmark into a measurement of
+	// TCP setup rather than of the server.
+	p := pool.New(pool.WithMaxIdle(cfg.clients))
 	defer p.Close()
 
 	value := strings.Repeat("x", cfg.valueSize)
@@ -325,16 +330,22 @@ func worker(p *pool.Pool, route func(string) string, cfg config, value string,
 		latency := time.Since(due)
 
 		failed := err != nil
-		if !failed && isRead && strings.HasPrefix(resp, "-") {
-			// A GET miss is a valid answer, not a failure. Only transport
-			// errors and unexpected write rejections count as errors.
-			failed = false
-		}
-		if !failed && !isRead && strings.HasPrefix(resp, "-") {
-			failed = true
+		miss := false
+
+		if !failed && strings.HasPrefix(resp, "-") {
+			if isRead {
+				// A GET miss is a valid answer, not a failure — but it is
+				// worth counting separately. With LRU eviction enabled the
+				// miss rate is the whole point of the experiment.
+				miss = true
+			} else {
+				failed = true
+			}
 		}
 
-		samples = append(samples, sample{latency: latency, isRead: isRead, failed: failed})
+		samples = append(samples, sample{
+			latency: latency, isRead: isRead, failed: failed, miss: miss,
+		})
 	}
 
 	return samples
@@ -351,11 +362,15 @@ func report(cfg config, samples []sample, elapsed time.Duration, targets []strin
 	var reads, writes []time.Duration
 	var all []time.Duration
 	errors := 0
+	misses := 0
 
 	for _, s := range samples {
 		if s.failed {
 			errors++
 			continue
+		}
+		if s.miss {
+			misses++
 		}
 		all = append(all, s.latency)
 		if s.isRead {
@@ -363,6 +378,11 @@ func report(cfg config, samples []sample, elapsed time.Duration, targets []strin
 		} else {
 			writes = append(writes, s.latency)
 		}
+	}
+
+	hitRate := 0.0
+	if len(reads) > 0 {
+		hitRate = float64(len(reads)-misses) / float64(len(reads)) * 100
 	}
 
 	throughput := float64(len(samples)) / elapsed.Seconds()
@@ -385,6 +405,7 @@ func report(cfg config, samples []sample, elapsed time.Duration, targets []strin
 ────────────────────────────────────────────────────────────
  THROUGHPUT     %.0f ops/sec
  operations     %d total (%d reads, %d writes)
+ read hit rate  %.1f%% (%d misses)
  errors         %d (%.3f%%)
 ────────────────────────────────────────────────────────────
  LATENCY — %s
@@ -397,6 +418,7 @@ func report(cfg config, samples []sample, elapsed time.Duration, targets []strin
 		modeLabel(cfg),
 		throughput,
 		len(samples), len(reads), len(writes),
+		hitRate, misses,
 		errors, float64(errors)/float64(len(samples))*100,
 		latencyKind,
 	)
