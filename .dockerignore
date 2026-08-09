@@ -1,0 +1,39 @@
+# Keep the build context small and the image reproducible.
+#
+# Everything here is either irrelevant to the build, or actively harmful to
+# copy into an image (local runtime state, editor config, git history).
+
+# Git history — large, and nothing in the build needs it.
+.git
+.gitignore
+.github
+
+# Local runtime state. The WAL in particular must never be baked into an
+# image: it is per-node recovery state, and shipping one node's log inside
+# the image every node starts from would give every replica the same
+# phantom keys on first boot.
+data/
+*.log
+
+# Build output — rebuilt inside the container.
+bin/
+/server
+/client
+/bench
+
+# Editor and OS noise.
+.DS_Store
+.vscode/
+.idea/
+.qodo/
+*.swp
+
+# Docs and deployment manifests are not build inputs.
+docs/
+deployments/
+README.md
+*.md
+
+# Test artifacts.
+coverage.out
+*.test

@@ -1,0 +1,126 @@
+# A runnable three-node cluster.
+#
+#   docker compose up --build
+#
+# Topology is a star, not a mesh, and that is forced rather than chosen —
+# see the warning below.
+#
+#   kv-primary  :6379  ── replicates to ──►  kv-replica-1  :6380
+#                       ── replicates to ──►  kv-replica-2  :6381
+#
+# ┌─ IMPORTANT: replication has no loop prevention ────────────────────────┐
+# │                                                                        │
+# │ A replica receives writes as ordinary SET commands on the normal wire  │
+# │ protocol. The server's dispatch path re-replicates every SET it        │
+# │ accepts whenever a replicator is configured — it does not distinguish  │
+# │ a client write from a replicated one.                                  │
+# │                                                                        │
+# │ So configuring REPLICAS on more than one node creates an infinite      │
+# │ replication loop: A forwards to B, B forwards back to A and on to C,   │
+# │ and the cluster saturates itself within seconds.                       │
+# │                                                                        │
+# │ The HELLO replica: handshake already marks these connections, but it   │
+# │ is currently only consulted by the rate limiter. Suppressing           │
+# │ re-replication for connections marked as replicas would fix this and   │
+# │ is a small change — it is listed as deferred rather than done because  │
+# │ it was discovered while writing this file, after Phase 8 was closed.   │
+# │                                                                        │
+# │ Until then: exactly one node may have REPLICAS set.                    │
+# └────────────────────────────────────────────────────────────────────────┘
+#
+# The consequence is that this is single-primary replication, not the
+# sharded-plus-replicated cluster the consistent hash ring is built for. The
+# ring works — routing is correct and testable — but every write must reach
+# kv-primary for replication to happen at all.
+
+services:
+  kv-primary:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distributed-kv-store:latest
+    container_name: kv-primary
+    ports:
+      - "6379:6379"   # wire protocol
+      - "9090:9090"   # metrics
+    environment:
+      ADDR: ":6379"
+      METRICS_ADDR: ":9090"
+      WAL_PATH: "/data/wal.log"
+      # Service names resolve over the compose network's DNS.
+      REPLICAS: "kv-replica-1:6379,kv-replica-2:6379"
+      # LRU eviction. Unset means unlimited — see cmd/server for why that is
+      # the default.
+      CAPACITY: "100000"
+      # Rate limiting is off by default. Note that if you enable it here you
+      # must keep it off on the replicas, or set it high enough that inbound
+      # replication is not throttled — a throttled replication write burns
+      # its retries and is then dropped, which is silent divergence.
+      # RATE_LIMIT: "50000"
+    volumes:
+      - primary-data:/data
+    networks:
+      - kv-net
+    depends_on:
+      - kv-replica-1
+      - kv-replica-2
+    restart: unless-stopped
+    # No healthcheck here. Compose healthchecks run a command inside the
+    # container, and distroless has no shell, no curl, and no wget. The
+    # client binary has no ping flag to invoke either. Kubernetes does not
+    # have this problem — its httpGet probe is performed by the kubelet from
+    # outside the container, so it can hit /healthz directly. See
+    # deployments/kubernetes/statefulset.yaml.
+
+  kv-replica-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distributed-kv-store:latest
+    container_name: kv-replica-1
+    ports:
+      - "6380:6379"
+      - "9091:9090"
+    environment:
+      ADDR: ":6379"
+      METRICS_ADDR: ":9090"
+      WAL_PATH: "/data/wal.log"
+      CAPACITY: "100000"
+      # No REPLICAS — see the loop warning above.
+    volumes:
+      - replica1-data:/data
+    networks:
+      - kv-net
+    restart: unless-stopped
+
+  kv-replica-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distributed-kv-store:latest
+    container_name: kv-replica-2
+    ports:
+      - "6381:6379"
+      - "9092:9090"
+    environment:
+      ADDR: ":6379"
+      METRICS_ADDR: ":9090"
+      WAL_PATH: "/data/wal.log"
+      CAPACITY: "100000"
+    volumes:
+      - replica2-data:/data
+    networks:
+      - kv-net
+    restart: unless-stopped
+
+volumes:
+  # Named volumes so each node's WAL survives container restarts, and so
+  # nodes never share a log file. Three nodes appending to one file would
+  # reproduce the Phase 8e failure at the filesystem level.
+  primary-data:
+  replica1-data:
+  replica2-data:
+
+networks:
+  kv-net:
+    driver: bridge
