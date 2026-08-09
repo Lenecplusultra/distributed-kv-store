@@ -11,16 +11,20 @@
 // In cluster mode:
 //   - Writes (SET/DEL) go to the primary (first node clockwise from key)
 //   - Reads (GET) try the primary first, then replicas if the primary is down
+//
+// Phase 8b: connections are pooled and reused per node rather than dialed
+// per command. A stale pooled connection is retried once transparently —
+// see internal/pool for why that beats validating on checkout.
 package main
 
 import (
 	"bufio"
 	"fmt"
-	"net"
 	"os"
 	"strings"
 
 	"github.com/Lenecplusultra/distributed-kv-store/internal/cluster"
+	"github.com/Lenecplusultra/distributed-kv-store/internal/pool"
 )
 
 func main() {
@@ -45,6 +49,9 @@ func main() {
 	}
 	fmt.Println("type SET/GET/DEL/PING — Ctrl+C to quit")
 
+	p := pool.New()
+	defer p.Close()
+
 	stdin := bufio.NewReader(os.Stdin)
 
 	for {
@@ -64,7 +71,7 @@ func main() {
 		var resp string
 		var sendErr error
 		for i, target := range targets {
-			resp, sendErr = send(target, line)
+			resp, sendErr = p.Do(target, line)
 			if sendErr == nil {
 				break
 			}
@@ -118,20 +125,4 @@ func resolveTargets(c *cluster.Cluster, line, fallback string) []string {
 		}
 		return []string{addr}
 	}
-}
-
-// send opens a TCP connection, sends one command, returns the response.
-func send(addr, cmd string) (string, error) {
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		return "", fmt.Errorf("cannot connect to %s: %w", addr, err)
-	}
-	defer conn.Close()
-
-	fmt.Fprintf(conn, "%s\n", cmd)
-	resp, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		return "", fmt.Errorf("read from %s: %w", addr, err)
-	}
-	return resp, nil
 }

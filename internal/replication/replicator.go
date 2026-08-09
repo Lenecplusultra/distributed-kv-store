@@ -22,6 +22,24 @@
 // that replica's queue instead of letting the next write overtake it.
 // Ordering follows from the structure rather than from timing.
 //
+// # Persistent connections (Phase 8b)
+//
+// Each worker holds one long-lived connection to its replica rather than
+// dialing per write. Because exactly one goroutine ever writes to a given
+// replica, that connection has a single owner and needs no pool — the
+// concurrency shape that makes internal/pool necessary for clients simply
+// does not arise here.
+//
+// This also amortises the HELLO handshake: it is sent once when the
+// connection is established, not once per write. Under the previous design
+// every replicated command cost a dial, a handshake round trip, and a write
+// round trip; it now costs one write round trip.
+//
+// Staleness is handled the same way as in internal/pool — used
+// optimistically, and on transport failure the connection is dropped and
+// redialed on the next attempt, which the existing retry loop already
+// provides for free.
+//
 // # Backpressure, and why blocking beats dropping
 //
 // Queues are bounded. When a replica's queue fills, Replicate blocks the
@@ -93,10 +111,28 @@ const (
 	// Without it, enabling RATE_LIMIT on a replica would throttle inbound
 	// replication and drop writes.
 	//
+	// Sent once per connection rather than once per write, which is the
+	// point of holding the connection open.
+	//
 	// Forgeable by any client — a trusted-network assumption, consistent
 	// with the replication path having no authentication at all.
 	replicaHello = "HELLO replica:primary"
 )
+
+// replicaConn is a worker's connection to its replica, with the buffered
+// reader bound to it. The reader must travel with the connection: bufio may
+// hold buffered bytes, and a fresh reader would discard them and desync the
+// protocol stream.
+type replicaConn struct {
+	nc     net.Conn
+	reader *bufio.Reader
+}
+
+func (c *replicaConn) close() {
+	if c != nil && c.nc != nil {
+		c.nc.Close()
+	}
+}
 
 // Replicator sends write commands to a fixed set of replica addresses,
 // preserving per-replica ordering.
@@ -183,11 +219,18 @@ func (r *Replicator) Close() {
 	r.wg.Wait()
 }
 
-// worker drains one replica's queue sequentially. Being the only goroutine
-// sending to this replica is what makes delivery order match enqueue order.
+// worker drains one replica's queue sequentially, over one long-lived
+// connection. Being the only goroutine sending to this replica is what makes
+// delivery order match enqueue order, and what makes a single connection
+// sufficient.
 func (r *Replicator) worker(addr string, q chan string) {
 	probe := time.NewTicker(r.probeInterval)
 	defer probe.Stop()
+
+	// Owned solely by this goroutine. nil means "not currently connected";
+	// the next delivery attempt will dial.
+	var rc *replicaConn
+	defer func() { rc.close() }()
 
 	for {
 		select {
@@ -196,8 +239,9 @@ func (r *Replicator) worker(addr string, q chan string) {
 
 		case <-probe.C:
 			// Only meaningful while dead. Revival is checked with a cheap
-			// PING rather than by attempting a real write, so a dead
-			// replica's queue never stalls on dial timeouts.
+			// PING on a throwaway connection rather than by attempting a
+			// real write, so a dead replica's queue never stalls on dial
+			// timeouts.
 			if r.health.IsAlive(addr) {
 				continue
 			}
@@ -217,7 +261,7 @@ func (r *Replicator) worker(addr string, q chan string) {
 				continue
 			}
 
-			if err := r.sendWithRetry(addr, cmd); err != nil {
+			if err := r.sendWithRetry(addr, cmd, &rc); err != nil {
 				log.Printf("[replication] delivery to %s failed: %v", addr, err)
 
 				if r.health.Miss(addr) {
@@ -233,15 +277,17 @@ func (r *Replicator) worker(addr string, q chan string) {
 	}
 }
 
-// sendWithRetry attempts delivery with exponential backoff. Runs inside the
-// replica's worker, so retries hold that replica's queue and cannot be
-// overtaken by a later write.
-func (r *Replicator) sendWithRetry(addr, cmd string) error {
+// sendWithRetry attempts delivery with exponential backoff, reusing the
+// worker's connection and redialing whenever it has been dropped.
+//
+// Runs inside the replica's worker, so retries hold that replica's queue and
+// cannot be overtaken by a later write.
+func (r *Replicator) sendWithRetry(addr, cmd string, rc **replicaConn) error {
 	backoff := 100 * time.Millisecond
 	var lastErr error
 
 	for attempt := 1; attempt <= r.maxRetries; attempt++ {
-		if err := r.send(addr, cmd); err == nil {
+		if err := r.send(addr, cmd, rc); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -259,47 +305,83 @@ func (r *Replicator) sendWithRetry(addr, cmd string) error {
 	return lastErr
 }
 
-// send opens a connection, identifies as replication traffic, writes cmd,
-// and reads the response. One connection per command — pooling is Phase 8b.
-func (r *Replicator) send(addr, cmd string) error {
-	conn, err := net.DialTimeout("tcp", addr, r.timeout)
-	if err != nil {
-		return fmt.Errorf("dial %s: %w", addr, err)
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(r.timeout))
-
-	reader := bufio.NewReader(conn)
-
-	if _, err := fmt.Fprintf(conn, "%s\n", replicaHello); err != nil {
-		return fmt.Errorf("handshake write to %s: %w", addr, err)
-	}
-	helloResp, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("handshake read from %s: %w", addr, err)
-	}
-	if strings.HasPrefix(helloResp, "-") {
-		// A node predating HELLO rejects it as unknown. Not fatal — the
-		// write below still applies; this connection is simply subject to
-		// that node's rate limiter, if it has one.
-		log.Printf("[replication] %s rejected handshake — proceeding unexempted", addr)
+// send delivers one command over the worker's connection, establishing it
+// first if necessary. On transport failure the connection is closed and
+// cleared so the next attempt redials; on a protocol-level error response
+// the connection is healthy and kept.
+func (r *Replicator) send(addr, cmd string, rc **replicaConn) error {
+	if *rc == nil {
+		c, err := r.connect(addr)
+		if err != nil {
+			return err
+		}
+		*rc = c
 	}
 
-	if _, err := fmt.Fprintf(conn, "%s\n", cmd); err != nil {
+	c := *rc
+
+	if err := c.nc.SetDeadline(time.Now().Add(r.timeout)); err != nil {
+		c.close()
+		*rc = nil
+		return err
+	}
+
+	if _, err := fmt.Fprintf(c.nc, "%s\n", cmd); err != nil {
+		c.close()
+		*rc = nil
 		return fmt.Errorf("write to %s: %w", addr, err)
 	}
 
-	resp, err := reader.ReadString('\n')
+	resp, err := c.reader.ReadString('\n')
 	if err != nil {
+		c.close()
+		*rc = nil
 		return fmt.Errorf("read from %s: %w", addr, err)
 	}
+
 	if strings.HasPrefix(resp, "-") {
+		// The replica answered and rejected the command. The connection is
+		// fine; the command is not. Retrying would get the same answer.
 		return fmt.Errorf("replica %s returned error: %s", addr, strings.TrimSpace(resp))
 	}
 	return nil
 }
 
+// connect dials the replica and performs the HELLO handshake once for the
+// lifetime of the connection.
+func (r *Replicator) connect(addr string) (*replicaConn, error) {
+	nc, err := net.DialTimeout("tcp", addr, r.timeout)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
+	}
+
+	c := &replicaConn{nc: nc, reader: bufio.NewReader(nc)}
+
+	if err := nc.SetDeadline(time.Now().Add(r.timeout)); err != nil {
+		c.close()
+		return nil, err
+	}
+	if _, err := fmt.Fprintf(nc, "%s\n", replicaHello); err != nil {
+		c.close()
+		return nil, fmt.Errorf("handshake write to %s: %w", addr, err)
+	}
+	resp, err := c.reader.ReadString('\n')
+	if err != nil {
+		c.close()
+		return nil, fmt.Errorf("handshake read from %s: %w", addr, err)
+	}
+	if strings.HasPrefix(resp, "-") {
+		// A node predating HELLO rejects it as unknown. Not fatal — writes
+		// still apply; this connection is simply subject to that node's rate
+		// limiter, if it has one.
+		log.Printf("[replication] %s rejected handshake — proceeding unexempted", addr)
+	}
+
+	return c, nil
+}
+
 // ping checks whether a dead replica has come back, without sending a write.
+// Uses its own short-lived connection so it never disturbs worker state.
 func ping(addr string, timeout time.Duration) error {
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
