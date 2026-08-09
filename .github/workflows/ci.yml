@@ -70,12 +70,21 @@ jobs:
         # this repo — dependencies recorded but never used. An untidy go.mod
         # broke `go test` entirely once, because testify was required with no
         # go.sum entry.
+        #
+        # git status --porcelain rather than git diff on named paths: this
+        # project has no dependencies and therefore no go.sum, and `git diff`
+        # against a path that does not exist exits non-zero regardless of
+        # whether anything is actually untidy.
         run: |
           go mod tidy
-          if ! git diff --exit-code go.mod go.sum 2>/dev/null; then
-            echo "go.mod or go.sum is not tidy — run 'go mod tidy' and commit"
+          changed=$(git status --porcelain go.mod go.sum 2>/dev/null || true)
+          if [ -n "$changed" ]; then
+            echo "go.mod or go.sum is not tidy — run 'go mod tidy' and commit:"
+            echo "$changed"
+            git diff go.mod || true
             exit 1
           fi
+          echo "go.mod is tidy"
 
   # ── Tests ──────────────────────────────────────────────────────────────
   test:
@@ -171,7 +180,13 @@ jobs:
           echo "readiness: $(curl -fsS http://localhost:9090/readyz)"
 
           # One full request/response over the wire protocol.
-          response=$(printf 'PING\n' | timeout 5 nc localhost 6379 | tr -d '\r\n')
+          #
+          # -q 1 is load-bearing: the wire protocol has no close signal, so
+          # nc holds the connection open after reading the reply and would
+          # otherwise sit there until `timeout` killed it with exit 124 —
+          # which pipefail then reports as a failure even though the server
+          # answered correctly. -q 1 exits one second after stdin reaches EOF.
+          response=$(printf 'PING\n' | nc -q 1 localhost 6379 | tr -d '\r\n')
           if [ "$response" != "+PONG" ]; then
             echo "expected +PONG from the wire protocol, got: '$response'"
             kill $server_pid 2>/dev/null || true
@@ -216,7 +231,6 @@ jobs:
         # image or drops that line, the container silently starts running as
         # uid 0 and nothing else in the pipeline would notice.
         run: |
-          uid=$(docker run --rm --entrypoint /bench distributed-kv-store:ci -h 2>&1 >/dev/null || true)
           config_user=$(docker image inspect distributed-kv-store:ci --format='{{.Config.User}}')
           echo "image user: '$config_user'"
           if [ "$config_user" = "" ] || [ "$config_user" = "root" ] || [ "$config_user" = "0" ]; then
@@ -254,11 +268,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          printf 'SET ci-key ci-value\n' | timeout 5 nc localhost 6379
+          printf 'SET ci-key ci-value\n' | nc -q 1 localhost 6379
 
           # Replication is asynchronous, so poll rather than assume.
           for i in $(seq 1 20); do
-            got=$(printf 'GET ci-key\n' | timeout 5 nc localhost 6380 | tr -d '\r\n' || true)
+            got=$(printf 'GET ci-key\n' | nc -q 1 localhost 6380 | tr -d '\r\n' || true)
             if [ "$got" = "+ci-value" ]; then
               echo "replication confirmed: primary -> kv-replica-1"
               exit 0
@@ -293,20 +307,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate against the Kubernetes API schema
-        # Client-side validation only — this does not need a cluster. It
-        # catches typos, wrong apiVersions, and fields that do not exist,
-        # which otherwise surface at apply time in front of a real cluster.
-        uses: instrumenta/kubeval-action@master
-        with:
-          files: deployments/kubernetes
-        continue-on-error: true
-
-      - name: Dry-run parse with kubectl
-        # A second, independent check. kubeval's action is unmaintained and
-        # may break; this uses kubectl's own parser, which cannot drift from
-        # what the cluster will actually accept.
+      - name: YAML parses
+        # The cheapest possible check, and it catches indentation mistakes
+        # and duplicate keys before anything heavier runs.
         run: |
-          curl -fsSLO "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          chmod +x kubectl
-          ./kubectl apply --dry-run=client -f deployments/kubernetes/manifests.yaml --validate=false
+          python3 - <<'EOF'
+          import sys, yaml
+          docs = list(yaml.safe_load_all(open("deployments/kubernetes/manifests.yaml")))
+          docs = [d for d in docs if d]
+          print(f"parsed {len(docs)} documents:")
+          for d in docs:
+              print(f"  {d.get('kind')}/{d['metadata']['name']}")
+          EOF
+
+      - name: Validate against the Kubernetes API schema
+        # kubeconform, not kubectl --dry-run=client.
+        #
+        # `kubectl apply --dry-run=client` is not actually offline: it still
+        # contacts the API server to resolve resource kinds, so in CI it just
+        # produces connection-refused noise and fails. kubeconform validates
+        # against downloaded JSON schemas and needs no cluster at all.
+        run: |
+          KUBECONFORM_VERSION=v0.6.7
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar xz kubeconform
+          ./kubeconform \
+            -strict \
+            -summary \
+            -kubernetes-version 1.29.0 \
+            deployments/kubernetes/manifests.yaml
