@@ -14,6 +14,9 @@
 // Phase 7 additions:
 //   - optional per-client token-bucket rate limiting
 //   - HELLO <clientID> handshake, setting per-connection rate-limit identity
+//
+// Phase 8c additions:
+//   - optional metrics recording on the command path
 package tcp
 
 import (
@@ -27,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Lenecplusultra/distributed-kv-store/internal/metrics"
 	"github.com/Lenecplusultra/distributed-kv-store/internal/protocol"
 	"github.com/Lenecplusultra/distributed-kv-store/internal/ratelimiter"
 	"github.com/Lenecplusultra/distributed-kv-store/internal/replication"
@@ -52,13 +56,14 @@ import (
 const replicaIDPrefix = "replica:"
 
 // Server wraps a TCP listener, the shared store, an optional WAL,
-// an optional Replicator, and an optional rate limiter.
+// an optional Replicator, an optional rate limiter, and optional metrics.
 type Server struct {
 	addr       string
 	store      *storage.Store
 	wal        *wal.WAL
 	replicator *replication.Replicator
 	limiter    *ratelimiter.Limiter // nil means unlimited
+	metrics    *metrics.Metrics     // nil means no recording
 
 	mu       sync.Mutex // protects listener
 	listener net.Listener
@@ -67,9 +72,9 @@ type Server struct {
 // Option configures optional Server behaviour.
 //
 // The constructor previously took every dependency positionally. Rate
-// limiting would have made it a fifth parameter, and every existing call
-// site — including three test packages that do not care about limiting —
-// would have had to pass an explicit nil. Options keep the required
+// limiting would have made it a fifth parameter, and metrics a sixth, with
+// every existing call site — including three test packages that care about
+// neither — forced to pass explicit nils. Options keep the required
 // dependencies explicit and let optional ones be added without churn.
 type Option func(*Server)
 
@@ -77,6 +82,12 @@ type Option func(*Server)
 // the option: limiting stays disabled.
 func WithLimiter(l *ratelimiter.Limiter) Option {
 	return func(s *Server) { s.limiter = l }
+}
+
+// WithMetrics attaches a metrics registry. Passing nil is equivalent to
+// omitting the option: recording stays off.
+func WithMetrics(m *metrics.Metrics) Option {
+	return func(s *Server) { s.metrics = m }
 }
 
 // New creates a Server. Pass nil for w or r to disable WAL/replication.
@@ -124,8 +135,9 @@ func (s *Server) Shutdown() {
 // remoteHost returns a connection's remote IP without the ephemeral port.
 //
 // The port is stripped deliberately. Including it would give every new
-// connection from the same client a fresh bucket, and since the client opens
-// one connection per command, that would defeat the limiter entirely.
+// connection from the same client a fresh bucket, and since an unpooled
+// client opens one connection per command, that would defeat the limiter
+// entirely.
 func remoteHost(conn net.Conn) string {
 	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
 	if err != nil {
@@ -138,6 +150,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 	remote := conn.RemoteAddr().String()
 	log.Printf("[server] client connected: %s", remote)
+
+	s.metrics.ConnOpened()
+	defer s.metrics.ConnClosed()
 
 	// Rate-limit identity is per-connection state, not per-command. This
 	// mirrors how Redis tracks authentication: AUTH and HELLO set state on
@@ -158,11 +173,18 @@ func (s *Server) handleConn(conn net.Conn) {
 			break
 		}
 
+		// Timed from parse rather than from read, so latency measures work
+		// the server does rather than how long a client took to type.
+		start := time.Now()
+
 		cmd, err := protocol.Parse(line)
 		if err != nil {
+			s.metrics.RecordParseError()
 			fmt.Fprint(conn, protocol.Err("empty command"))
 			continue
 		}
+
+		s.metrics.RecordCommand(cmd.Name)
 
 		// HELLO rebinds this connection's identity. Handled here rather than
 		// in dispatch because dispatch has no access to connection state.
@@ -174,11 +196,13 @@ func (s *Server) handleConn(conn net.Conn) {
 		if cmd.Name == "HELLO" {
 			if len(cmd.Args) != 1 {
 				fmt.Fprint(conn, protocol.Err("HELLO requires exactly one argument"))
+				s.metrics.RecordLatency(time.Since(start))
 				continue
 			}
 			clientID = cmd.Args[0]
 			log.Printf("[server] %s identified as %q", remote, clientID)
 			fmt.Fprint(conn, protocol.OK("OK"))
+			s.metrics.RecordLatency(time.Since(start))
 			continue
 		}
 
@@ -186,11 +210,14 @@ func (s *Server) handleConn(conn net.Conn) {
 		// throttled client still gets a syntax error for malformed input,
 		// which is more useful than a rate-limit error masking a real bug.
 		if !s.isExempt(clientID) && !s.limiter.Allow(clientID) {
+			s.metrics.RecordRateLimitDenied()
 			fmt.Fprint(conn, protocol.Err("rate limit exceeded"))
+			s.metrics.RecordLatency(time.Since(start))
 			continue
 		}
 
 		fmt.Fprint(conn, s.dispatch(cmd))
+		s.metrics.RecordLatency(time.Since(start))
 	}
 	log.Printf("[server] client disconnected: %s", remote)
 }
@@ -248,6 +275,7 @@ func (s *Server) dispatch(cmd *protocol.Command) string {
 		if s.wal != nil {
 			if err := s.wal.Append(entry); err != nil {
 				log.Printf("[server] WAL append error: %v", err)
+				s.metrics.RecordWALError()
 				return protocol.Err("internal error: persistence failed")
 			}
 		}
@@ -279,6 +307,7 @@ func (s *Server) dispatch(cmd *protocol.Command) string {
 			return protocol.Err("GET requires a key")
 		}
 		val, ok := s.store.Get(cmd.Args[0])
+		s.metrics.RecordGet(ok)
 		if !ok {
 			return protocol.Err("key not found")
 		}
@@ -292,6 +321,7 @@ func (s *Server) dispatch(cmd *protocol.Command) string {
 			entry := wal.Entry{Op: "DEL", Key: cmd.Args[0]}
 			if err := s.wal.Append(entry); err != nil {
 				log.Printf("[server] WAL append error: %v", err)
+				s.metrics.RecordWALError()
 				return protocol.Err("internal error: persistence failed")
 			}
 		}

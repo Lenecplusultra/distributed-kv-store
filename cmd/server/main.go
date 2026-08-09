@@ -2,25 +2,36 @@
 //
 // Configuration is entirely through environment variables:
 //
-//	ADDR        listen address                  (default :6379)
-//	WAL_PATH    write-ahead log file            (default data/wal.log)
-//	REPLICAS    comma-separated replica addrs   (default none)
-//	RATE_LIMIT  sustained requests/sec/client   (default unset = unlimited)
-//	BURST       token bucket capacity           (default = RATE_LIMIT)
+//	ADDR          listen address                  (default :6379)
+//	METRICS_ADDR  Prometheus endpoint address     (default :9090, "" disables)
+//	WAL_PATH      write-ahead log file            (default data/wal.log)
+//	REPLICAS      comma-separated replica addrs   (default none)
+//	RATE_LIMIT    sustained requests/sec/client   (default unset = unlimited)
+//	BURST         token bucket capacity           (default = RATE_LIMIT)
 //
 // Startup order:
 //
 //	open WAL → recover into store → start TTL sweeper → build replicator
-//	→ build rate limiter → start reaper → listen
+//	→ build rate limiter → start reaper → serve metrics → listen
 //
 // The WAL is recovered before the listener binds, so no client can read a
 // partially recovered store.
+//
+// # Two listeners
+//
+// The wire protocol is a bespoke line format and cannot also speak HTTP, so
+// metrics are served on their own port. That is the usual shape for this —
+// an application port and a separate operational port — and it means a
+// Kubernetes deployment in Phase 9 can scrape metrics without exposing them
+// on the data path.
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -28,6 +39,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Lenecplusultra/distributed-kv-store/internal/metrics"
 	"github.com/Lenecplusultra/distributed-kv-store/internal/ratelimiter"
 	"github.com/Lenecplusultra/distributed-kv-store/internal/replication"
 	"github.com/Lenecplusultra/distributed-kv-store/internal/storage"
@@ -36,11 +48,13 @@ import (
 )
 
 const (
-	defaultAddr    = ":6379"
-	defaultWALPath = "data/wal.log"
-	sweepInterval  = 5 * time.Second
-	reaperInterval = 1 * time.Minute
-	reaperIdleTTL  = 10 * time.Minute
+	defaultAddr        = ":6379"
+	defaultMetricsAddr = ":9090"
+	defaultWALPath     = "data/wal.log"
+	sweepInterval      = 5 * time.Second
+	reaperInterval     = 1 * time.Minute
+	reaperIdleTTL      = 10 * time.Minute
+	metricsIOTimeout   = 5 * time.Second
 )
 
 func main() {
@@ -53,6 +67,7 @@ func main() {
 	defer cancel()
 
 	store := storage.New()
+	m := metrics.New()
 
 	// --- WAL: open and recover before accepting any traffic ---
 	w, err := wal.Open(walPath)
@@ -77,7 +92,26 @@ func main() {
 		addrs := splitAndTrim(raw)
 		if len(addrs) > 0 {
 			replicator = replication.New(addrs)
+			defer replicator.Close()
 			log.Printf("[server] replicating to %v", addrs)
+
+			// Sampled at scrape time rather than mirrored into a counter:
+			// the replicator's health tracker is the source of truth, and
+			// copying it here would create a second thing to keep in sync.
+			m.RegisterGauge("kv_replica_alive",
+				"1 if the replica is accepting writes, 0 if declared dead",
+				"replica",
+				func() map[string]float64 {
+					out := make(map[string]float64)
+					for addr, st := range replicator.Health() {
+						if st.Alive {
+							out[addr] = 1
+						} else {
+							out[addr] = 0
+						}
+					}
+					return out
+				})
 		}
 	}
 
@@ -90,10 +124,16 @@ func main() {
 		limiter.StartReaper(ctx, reaperInterval, reaperIdleTTL)
 	}
 
+	// --- Metrics endpoint ---
+	metricsSrv := startMetricsServer(m)
+
 	// --- Server ---
 	// limiter may be nil; WithLimiter(nil) leaves limiting disabled, and
 	// Allow on a nil limiter admits everything.
-	srv := tcp.New(addr, store, w, replicator, tcp.WithLimiter(limiter))
+	srv := tcp.New(addr, store, w, replicator,
+		tcp.WithLimiter(limiter),
+		tcp.WithMetrics(m),
+	)
 
 	// Signal handling: cancel background work, then unblock Start.
 	sigCh := make(chan os.Signal, 1)
@@ -102,6 +142,11 @@ func main() {
 		sig := <-sigCh
 		log.Printf("[server] received %s, shutting down", sig)
 		cancel()
+		if metricsSrv != nil {
+			shutdownCtx, done := context.WithTimeout(context.Background(), 2*time.Second)
+			defer done()
+			metricsSrv.Shutdown(shutdownCtx)
+		}
 		srv.Shutdown()
 	}()
 
@@ -109,6 +154,47 @@ func main() {
 		log.Fatalf("[server] fatal: %v", err)
 	}
 	log.Printf("[server] stopped cleanly")
+}
+
+// startMetricsServer serves the Prometheus endpoint on its own port,
+// returning nil when METRICS_ADDR is explicitly empty.
+//
+// A failure to bind is logged rather than fatal: losing observability should
+// not take down a node that is otherwise serving traffic correctly. That is
+// the opposite of the RATE_LIMIT decision below, and deliberately so — a
+// silently unthrottled server misbehaves, whereas a server without metrics
+// merely goes unobserved.
+func startMetricsServer(m *metrics.Metrics) *http.Server {
+	addr, set := os.LookupEnv("METRICS_ADDR")
+	if !set {
+		addr = defaultMetricsAddr
+	}
+	if addr == "" {
+		log.Printf("[server] metrics endpoint disabled")
+		return nil
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", m.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "ok")
+	})
+
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  metricsIOTimeout,
+		WriteTimeout: metricsIOTimeout,
+	}
+
+	go func() {
+		log.Printf("[server] metrics on %s/metrics", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("[server] metrics endpoint stopped: %v", err)
+		}
+	}()
+
+	return srv
 }
 
 // buildLimiter reads RATE_LIMIT and BURST, returning nil when rate limiting
