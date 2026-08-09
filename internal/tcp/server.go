@@ -17,6 +17,11 @@
 //
 // Phase 8c additions:
 //   - optional metrics recording on the command path
+//
+// Phase 9 fix:
+//   - writes arriving from a replica connection are applied locally but not
+//     re-replicated, which is what makes any topology other than a star
+//     possible
 package tcp
 
 import (
@@ -216,7 +221,11 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
-		fmt.Fprint(conn, s.dispatch(cmd))
+		// A write that arrived from a replica connection must be applied
+		// locally but never forwarded on. Without this, two nodes each
+		// configured with the other as a replica forward the same write back
+		// and forth forever, and the cluster saturates itself in seconds.
+		fmt.Fprint(conn, s.dispatch(cmd, s.isExempt(clientID)))
 		s.metrics.RecordLatency(time.Since(start))
 	}
 	log.Printf("[server] client disconnected: %s", remote)
@@ -229,7 +238,17 @@ func (s *Server) isExempt(clientID string) bool {
 
 // dispatch routes a command to the store, writing to WAL first for
 // mutations, then triggering async replication.
-func (s *Server) dispatch(cmd *protocol.Command) string {
+//
+// fromReplica reports whether this command arrived over a connection that
+// identified itself with the replica: prefix. Such commands are persisted
+// and applied exactly like client writes — a replica needs its own WAL and
+// its own copy of the data — but they are not forwarded onward.
+//
+// This is the same rule Redis applies: a replica does not propagate the
+// stream it receives from its primary back up. Without it, replication is
+// only safe in a star topology with exactly one node configured to
+// replicate, because any cycle in the graph becomes an infinite loop.
+func (s *Server) dispatch(cmd *protocol.Command, fromReplica bool) string {
 	switch cmd.Name {
 
 	case "PING":
@@ -287,9 +306,9 @@ func (s *Server) dispatch(cmd *protocol.Command) string {
 			s.store.Set(key, value)
 		}
 
-		// Replicate asynchronously.
+		// Replicate asynchronously, unless this write came from a replica.
 		// Use EXAT so replicas get the exact expiry, not a fresh EX.
-		if s.replicator != nil {
+		if s.replicator != nil && !fromReplica {
 			var replicaCmd string
 			if entry.HasTTL {
 				replicaCmd = fmt.Sprintf("SET %s %s EXAT %d",
@@ -329,8 +348,8 @@ func (s *Server) dispatch(cmd *protocol.Command) string {
 			return protocol.Err("key not found")
 		}
 
-		// Replicate the deletion.
-		if s.replicator != nil {
+		// Replicate the deletion, unless it came from a replica.
+		if s.replicator != nil && !fromReplica {
 			s.replicator.Replicate(fmt.Sprintf("DEL %s", cmd.Args[0]))
 		}
 		return protocol.OK("OK")
