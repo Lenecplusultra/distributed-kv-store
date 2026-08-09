@@ -129,9 +129,9 @@ PING                    → +PONG
 | 4     | Consistent hashing + clustering | ✅ Complete   |
 | 5     | Replication                     | ✅ Complete   |
 | 6     | Failure detection + heartbeats  | ✅ Complete   |
-| 7     | Token-bucket rate limiting      | 🔨 In progress|
-| 8     | Observability + benchmarks      | 📋 Planned    |
-| 9     | Docker + Kubernetes + CI/CD     | 📋 Planned    |
+| 7     | Token-bucket rate limiting      | ✅ Complete   |
+| 8     | Observability + benchmarks      | ✅ Complete   |
+| 9     | Docker + Kubernetes + CI/CD     | ✅ Complete   |
 
 ---
 
