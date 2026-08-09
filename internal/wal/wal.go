@@ -81,6 +81,12 @@ type WAL struct {
 	mu     sync.Mutex
 	file   *os.File
 	writer *bufio.Writer
+
+	// lastErr holds the most recent append failure, cleared on the next
+	// success. This is current state rather than a cumulative count, which
+	// is what a readiness probe needs: "can this node accept writes right
+	// now", not "has it ever failed".
+	lastErr error
 }
 
 // Open opens the WAL file at path, creating it if it does not exist.
@@ -113,15 +119,43 @@ func (w *WAL) Append(e Entry) error {
 
 	if _, err := w.writer.WriteString(line); err != nil {
 		w.resetWriterLocked()
-		return fmt.Errorf("wal write: %w", err)
+		w.lastErr = fmt.Errorf("wal write: %w", err)
+		return w.lastErr
 	}
 
 	// Flush to OS buffer. Not fsync — see package doc for the tradeoff.
 	if err := w.writer.Flush(); err != nil {
 		w.resetWriterLocked()
-		return fmt.Errorf("wal flush: %w", err)
+		w.lastErr = fmt.Errorf("wal flush: %w", err)
+		return w.lastErr
 	}
+
+	w.lastErr = nil
 	return nil
+}
+
+// Healthy reports whether the most recent append succeeded, returning the
+// failure otherwise.
+//
+// This exists for readiness probes. A node whose WAL is failing still
+// accepts connections and still serves reads correctly — it is alive, and
+// restarting it would not help if the underlying cause is a full or
+// read-only volume. But it cannot accept writes, so it should be removed
+// from the load balancer rather than killed.
+//
+// That is precisely the liveness/readiness distinction: liveness answers
+// "should I restart this", readiness answers "should I send it traffic".
+// Conflating them here would turn a degraded node into a crash loop.
+//
+// A nil WAL is healthy: a server configured without persistence has no
+// write path to fail.
+func (w *WAL) Healthy() error {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.lastErr
 }
 
 // resetWriterLocked discards the buffered writer's state, including any

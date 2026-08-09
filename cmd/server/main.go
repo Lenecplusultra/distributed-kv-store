@@ -129,7 +129,7 @@ func main() {
 	}
 
 	// --- Metrics endpoint ---
-	metricsSrv := startMetricsServer(m)
+	metricsSrv := startMetricsServer(m, w)
 
 	// --- Server ---
 	// limiter may be nil; WithLimiter(nil) leaves limiting disabled, and
@@ -168,7 +168,7 @@ func main() {
 // the opposite of the RATE_LIMIT decision below, and deliberately so — a
 // silently unthrottled server misbehaves, whereas a server without metrics
 // merely goes unobserved.
-func startMetricsServer(m *metrics.Metrics) *http.Server {
+func startMetricsServer(m *metrics.Metrics, w *wal.WAL) *http.Server {
 	addr, set := os.LookupEnv("METRICS_ADDR")
 	if !set {
 		addr = defaultMetricsAddr
@@ -180,8 +180,35 @@ func startMetricsServer(m *metrics.Metrics) *http.Server {
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", m.Handler())
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "ok")
+
+	// Liveness: is the process running and able to serve HTTP?
+	//
+	// Deliberately unconditional. A liveness failure means "restart me", and
+	// restarting does not fix a full disk, a read-only volume, or a
+	// misconfigured mount. Making liveness depend on the WAL would turn a
+	// degraded-but-useful node into a crash loop.
+	mux.HandleFunc("/healthz", func(rw http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(rw, "ok")
+	})
+
+	// Readiness: should this node receive traffic?
+	//
+	// A node whose WAL is failing still serves reads correctly, but it
+	// rejects every write. It should be pulled out of the load balancer
+	// while remaining running, so an operator can inspect it and so it can
+	// rejoin automatically once the underlying problem clears — the WAL
+	// resets its buffered writer on error, so a transient fault recovers on
+	// the next successful append.
+	//
+	// This is the gap that Phase 8e made visible: during that outage the
+	// node reported healthy while silently rejecting 100% of writes.
+	mux.HandleFunc("/readyz", func(rw http.ResponseWriter, r *http.Request) {
+		if err := w.Healthy(); err != nil {
+			rw.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintf(rw, "not ready: %v\n", err)
+			return
+		}
+		fmt.Fprintln(rw, "ready")
 	})
 
 	srv := &http.Server{
@@ -192,7 +219,7 @@ func startMetricsServer(m *metrics.Metrics) *http.Server {
 	}
 
 	go func() {
-		log.Printf("[server] metrics on %s/metrics", addr)
+		log.Printf("[server] metrics on %s/metrics (health: /healthz, /readyz)", addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("[server] metrics endpoint stopped: %v", err)
 		}

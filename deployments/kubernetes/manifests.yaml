@@ -1,0 +1,389 @@
+# Kubernetes deployment for distributed-kv-store.
+#
+#   kubectl apply -f deployments/kubernetes/manifests.yaml
+#
+# ── Why two StatefulSets rather than one ─────────────────────────────────
+#
+# Every pod in a StatefulSet shares one pod spec, so every pod receives the
+# same environment. This system's replication is single-primary and
+# statically configured: exactly one node carries REPLICAS pointing at the
+# others. A single StatefulSet cannot express that — there is no way to give
+# ordinal 0 different configuration from ordinals 1 and 2 without deriving
+# role from POD_NAME at startup, which the server does not do.
+#
+# So the topology is explicit in the manifests instead of hidden in startup
+# logic: one StatefulSet for the primary, one for the replicas. This is an
+# honest reflection of what the system is. The consistent hash ring implies a
+# symmetric sharded cluster; the replication layer implements single-primary.
+# Reconciling those would need dynamic replica discovery or role derivation
+# from pod identity, and is out of scope.
+#
+# ── Why StatefulSet rather than Deployment ───────────────────────────────
+#
+# Two reasons, both load-bearing:
+#
+#   1. Stable network identity. The client computes hash(key) and routes to a
+#      node address. Deployment pods get random names, so every restart
+#      reshuffles the ring — keys route to a node that never held them, and
+#      there is no data migration to repair it. StatefulSet gives
+#      kv-primary-0.kv-primary-headless.<ns>.svc.cluster.local, stable across
+#      restarts and rescheduling.
+#
+#   2. Per-pod storage. Each node's WAL is its own recovery state, not shared.
+#      volumeClaimTemplates gives every pod its own PVC that follows it.
+#      Pointing several nodes at one shared volume would have them all
+#      appending to a single file — the Phase 8e failure reproduced at the
+#      filesystem layer.
+#
+# The usual StatefulSet benefit that does NOT apply here is ordered rollout.
+# Startup order does not matter: an unreachable replica is retried, declared
+# dead after three consecutive failures, and revived by a background probe.
+# The cluster converges regardless.
+
+---
+# ── Configuration shared by all nodes ────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kv-config
+  labels:
+    app: distributed-kv-store
+data:
+  ADDR: ":6379"
+  METRICS_ADDR: ":9090"
+  WAL_PATH: "/data/wal.log"
+  # LRU eviction. Omit to run unlimited — eviction changes semantics, since
+  # a written key can silently disappear, so it is opt-in.
+  CAPACITY: "100000"
+
+---
+# ── Headless service: stable per-pod DNS for the primary ─────────────────
+#
+# clusterIP: None means no load balancing and no virtual IP. Instead, each
+# pod gets its own A record:
+#
+#   kv-primary-0.kv-primary-headless.default.svc.cluster.local
+#
+# That per-pod addressability is the whole point — the replicas must be
+# reachable individually, not through a load balancer that might send a
+# replication write to the wrong node.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kv-primary-headless
+  labels:
+    app: distributed-kv-store
+    role: primary
+spec:
+  clusterIP: None
+  selector:
+    app: distributed-kv-store
+    role: primary
+  ports:
+    - name: wire
+      port: 6379
+      targetPort: wire
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kv-replica-headless
+  labels:
+    app: distributed-kv-store
+    role: replica
+spec:
+  clusterIP: None
+  selector:
+    app: distributed-kv-store
+    role: replica
+  ports:
+    - name: wire
+      port: 6379
+      targetPort: wire
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+
+---
+# ── Client-facing service ────────────────────────────────────────────────
+#
+# A normal ClusterIP service pointing at the primary, for clients that want
+# one address rather than routing themselves. Note this bypasses the
+# consistent hash ring entirely — a smart client should use the headless
+# service and route per key. This exists for simple access and for the
+# benchmark tool.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kv-store
+  labels:
+    app: distributed-kv-store
+spec:
+  type: ClusterIP
+  selector:
+    app: distributed-kv-store
+    role: primary
+  ports:
+    - name: wire
+      port: 6379
+      targetPort: wire
+
+---
+# ── Primary ──────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kv-primary
+  labels:
+    app: distributed-kv-store
+    role: primary
+spec:
+  serviceName: kv-primary-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: distributed-kv-store
+      role: primary
+  template:
+    metadata:
+      labels:
+        app: distributed-kv-store
+        role: primary
+      annotations:
+        # Prometheus scrape configuration. The metrics port is separate from
+        # the data port, so scraping never touches the wire protocol.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        # The image already runs as uid 65532 (distroless nonroot) and ships
+        # a pre-chowned /data. fsGroup makes the mounted PVC group-owned by
+        # the same id, which is what lets an unprivileged process write to a
+        # volume Kubernetes provisions as root.
+        #
+        # Without this the pod crash-loops on "permission denied" opening the
+        # WAL — the same failure the Docker build hit before /data was
+        # created with the right ownership.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: kv-store
+          image: distributed-kv-store:latest
+          # For local clusters (kind, minikube) the image is loaded directly
+          # rather than pulled. Change to Always with a real registry.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: wire
+              containerPort: 6379
+            - name: metrics
+              containerPort: 9090
+          envFrom:
+            - configMapRef:
+                name: kv-config
+          env:
+            # Static replica list. Each replica pod is addressed individually
+            # through the headless service, not through a load balancer.
+            - name: REPLICAS
+              value: "kv-replica-0.kv-replica-headless:6379,kv-replica-1.kv-replica-headless:6379"
+
+          # ── Probes ───────────────────────────────────────────────────────
+          #
+          # These deliberately point at different endpoints, because they
+          # answer different questions.
+
+          # Liveness: is the process running? A failure here restarts the pod.
+          # Unconditional by design — restarting does not fix a full disk or a
+          # read-only volume, so tying liveness to the WAL would convert a
+          # degraded node into a crash loop.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # Readiness: should this pod receive traffic? A failure here removes
+          # it from service endpoints but leaves it running.
+          #
+          # /readyz reports the WAL's current state. A node whose WAL is
+          # failing serves reads correctly but rejects every write, so it
+          # should be pulled from the load balancer and left alive — both so
+          # an operator can inspect it, and so it rejoins automatically when
+          # the fault clears.
+          #
+          # This closes the gap Phase 8e exposed, where the node reported
+          # healthy while silently rejecting 100% of writes.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 2
+
+          # Startup: gives WAL recovery time to finish before liveness begins.
+          # Recovery replays the entire log, which for a large WAL — and the
+          # WAL has no compaction — can take a while. Without this, liveness
+          # could kill a pod that is recovering correctly.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 5
+            failureThreshold: 30   # up to 150s to come up
+
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              # No CPU limit deliberately: CPU limits cause throttling that
+              # shows up as latency spikes, and this workload is latency
+              # sensitive. Memory is limited because an unbounded store plus
+              # an unbounded WAL will otherwise consume the node.
+              memory: "1Gi"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            # The WAL grows without bound — there is no compaction or
+            # snapshotting. This is sized generously and is still a ceiling
+            # rather than a solution; a long-lived node will eventually fill
+            # it. Documented as a known limitation, not a fixed one.
+            storage: 5Gi
+
+---
+# ── Replicas ─────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kv-replica
+  labels:
+    app: distributed-kv-store
+    role: replica
+spec:
+  serviceName: kv-replica-headless
+  replicas: 2
+  selector:
+    matchLabels:
+      app: distributed-kv-store
+      role: replica
+  template:
+    metadata:
+      labels:
+        app: distributed-kv-store
+        role: replica
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: kv-store
+          image: distributed-kv-store:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: wire
+              containerPort: 6379
+            - name: metrics
+              containerPort: 9090
+          envFrom:
+            - configMapRef:
+                name: kv-config
+          # No REPLICAS. Replica-originated writes are no longer re-forwarded
+          # — dispatch skips replication for connections identified with the
+          # replica: prefix — so a mesh would not loop. But the replica list
+          # is static configuration, so a mesh would still have to be written
+          # out by hand here, and single-primary is what the system is.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 2
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 5
+            failureThreshold: 30
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+
+---
+# ── Disruption budget ────────────────────────────────────────────────────
+#
+# During a voluntary disruption — a node drain, a cluster upgrade — keep at
+# least one replica available. Without this, a drain could evict both replica
+# pods at once, and since acknowledged writes are lost when no replica
+# receives them, that is a window of unreplicated writes.
+#
+# The primary has no budget: with replicas: 1 there is nothing to protect,
+# and blocking drains on a single-instance workload prevents node
+# maintenance entirely. That single point of failure is a real limitation of
+# single-primary replication, not something a PDB can paper over.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kv-replica-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: distributed-kv-store
+      role: replica
