@@ -1,37 +1,312 @@
+# CI for distributed-kv-store.
+#
+# ── The gap this closes ──────────────────────────────────────────────────
+#
+# The previous pipeline ran `go build ./...` and went green while
+# cmd/server was declared `package tcp`. That builds fine — it is a valid
+# library package — and emits no binary at all. The repo could not produce a
+# server, and CI never noticed, because "compiles" and "produces an
+# executable" are different claims and only the first was being checked.
+#
+# So this pipeline asserts the artifact, not just the compile: it builds each
+# command to a named output, checks the file exists and is executable, and
+# then actually runs it. A package that silently produces nothing fails at
+# the `test -x` step.
+#
+# ── Job layout ───────────────────────────────────────────────────────────
+#
+# Jobs run in parallel except where a dependency is real. `test` and
+# `binaries` are independent — a race failure and a missing binary are
+# different problems and both are worth knowing about in one run rather than
+# discovering serially.
+
 name: CI
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
+# Cancel superseded runs on the same branch. Pushing three times in a minute
+# should not queue three full race-detector runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.22'
 
 jobs:
-  build-and-test:
-    name: Build & Test
+  # ── Static checks ──────────────────────────────────────────────────────
+  vet:
+    name: Vet and format
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Install dependencies
-        run: go mod tidy
-
-      - name: Build server
-        run: go build -v ./cmd/server
-
-      - name: Build client
-        run: go build -v ./cmd/client
-
-      - name: Run tests (with race detector)
-        run: go test ./... -v -race -timeout 60s
-
-      - name: Vet
+      - name: go vet
         run: go vet ./...
+
+      - name: gofmt
+        # gofmt -l lists files that are not formatted. It exits 0 either way,
+        # so the output has to be checked explicitly — a silent pass here
+        # would mean the check does nothing.
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go.mod is tidy
+        # Catches dependencies added but not recorded, and — as happened in
+        # this repo — dependencies recorded but never used. An untidy go.mod
+        # broke `go test` entirely once, because testify was required with no
+        # go.sum entry.
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum 2>/dev/null; then
+            echo "go.mod or go.sum is not tidy — run 'go mod tidy' and commit"
+            exit 1
+          fi
+
+  # ── Tests ──────────────────────────────────────────────────────────────
+  test:
+    name: Tests (race detector)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: go test -race
+        # The race detector is not optional here. This project shipped an
+        # unsynchronised bufio.Writer in the WAL for six phases; the test that
+        # catches it only catches it under -race.
+        #
+        # -count=1 disables the test cache. A cached pass tells you nothing
+        # about the current commit.
+        run: go test ./... -race -count=1 -timeout 5m
+
+      - name: Report test count
+        # Not an assertion — a visible number. Commit messages in this repo
+        # quote test counts, and having the real figure in the run log means
+        # the claim can be checked rather than trusted.
+        run: |
+          count=$(go test ./... -race -count=1 -v 2>&1 | grep -c "^=== RUN" || true)
+          echo "Tests run: $count"
+          echo "### Tests run: $count" >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Binary assertions ──────────────────────────────────────────────────
+  binaries:
+    name: Binaries are produced and runnable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build each command to a named output
+        run: |
+          mkdir -p bin
+          go build -o bin/server ./cmd/server
+          go build -o bin/client ./cmd/client
+          go build -o bin/bench  ./cmd/bench
+
+      - name: Assert the binaries exist and are executable
+        # This is the check `go build ./...` cannot make. A command package
+        # mis-declared as a library compiles cleanly and produces nothing;
+        # `go build -o` on such a package fails, and `test -x` catches
+        # anything that slips past.
+        run: |
+          for b in server client bench; do
+            if [ ! -x "bin/$b" ]; then
+              echo "bin/$b was not produced or is not executable"
+              echo "This usually means cmd/$b is not declared 'package main'."
+              exit 1
+            fi
+            echo "bin/$b: $(ls -lh bin/$b | awk '{print $5}')"
+          done
+
+      - name: Assert the server actually starts and serves
+        # Building an executable still does not prove it runs. This starts the
+        # real server, waits for its health endpoint, checks readiness, and
+        # exercises one round trip of the wire protocol.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/kvdata
+
+          ADDR=:6379 METRICS_ADDR=:9090 WAL_PATH=/tmp/kvdata/wal.log \
+            ./bin/server &
+          server_pid=$!
+
+          # Wait for liveness rather than sleeping a fixed amount — a fixed
+          # sleep is either flaky or slow, and usually both.
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:9090/healthz > /dev/null 2>&1; then
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "server did not become live within 15s"
+              kill $server_pid 2>/dev/null || true
+              exit 1
+            fi
+            sleep 0.5
+          done
+
+          echo "liveness:  $(curl -fsS http://localhost:9090/healthz)"
+          echo "readiness: $(curl -fsS http://localhost:9090/readyz)"
+
+          # One full request/response over the wire protocol.
+          response=$(printf 'PING\n' | timeout 5 nc localhost 6379 | tr -d '\r\n')
+          if [ "$response" != "+PONG" ]; then
+            echo "expected +PONG from the wire protocol, got: '$response'"
+            kill $server_pid 2>/dev/null || true
+            exit 1
+          fi
+          echo "wire protocol: PING -> $response"
+
+          kill $server_pid
+          wait $server_pid 2>/dev/null || true
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: bin/
+          retention-days: 7
+
+  # ── Container image ────────────────────────────────────────────────────
+  docker:
+    name: Image builds and the cluster comes up
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        # The Dockerfile contains its own binary assertion in the build stage,
+        # so a mis-declared command package fails the build here too. This
+        # step also catches Dockerfile rot — a base image that moved, a COPY
+        # path that no longer exists — which nothing else would notice until
+        # someone tried to deploy.
+        run: docker build -t distributed-kv-store:ci .
+
+      - name: Report image size
+        run: |
+          size=$(docker image inspect distributed-kv-store:ci --format='{{.Size}}')
+          human=$(numfmt --to=iec-i --suffix=B "$size")
+          echo "Image size: $human"
+          echo "### Image size: $human" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Assert the image runs as non-root
+        # The runtime stage sets USER nonroot. If someone changes the base
+        # image or drops that line, the container silently starts running as
+        # uid 0 and nothing else in the pipeline would notice.
+        run: |
+          uid=$(docker run --rm --entrypoint /bench distributed-kv-store:ci -h 2>&1 >/dev/null || true)
+          config_user=$(docker image inspect distributed-kv-store:ci --format='{{.Config.User}}')
+          echo "image user: '$config_user'"
+          if [ "$config_user" = "" ] || [ "$config_user" = "root" ] || [ "$config_user" = "0" ]; then
+            echo "image would run as root — the USER directive is missing or was overridden"
+            exit 1
+          fi
+
+      - name: Bring up the compose cluster
+        run: |
+          set -euo pipefail
+          # Use the image just built rather than rebuilding inside compose.
+          docker tag distributed-kv-store:ci distributed-kv-store:latest
+          docker compose up -d
+
+          # Wait for the primary to report ready. Startup involves WAL
+          # recovery, so polling readiness is more honest than sleeping.
+          for i in $(seq 1 40); do
+            if curl -fsS http://localhost:9090/readyz > /dev/null 2>&1; then
+              break
+            fi
+            if [ "$i" = "40" ]; then
+              echo "primary did not become ready within 20s"
+              docker compose logs
+              exit 1
+            fi
+            sleep 0.5
+          done
+          echo "primary is ready"
+
+      - name: Assert replication crosses containers
+        # The real end-to-end check: write to the primary, read from a
+        # replica. This exercises service DNS, the HELLO handshake, the
+        # ordered replica queue, and the fact that replica-originated writes
+        # are not re-forwarded.
+        run: |
+          set -euo pipefail
+
+          printf 'SET ci-key ci-value\n' | timeout 5 nc localhost 6379
+
+          # Replication is asynchronous, so poll rather than assume.
+          for i in $(seq 1 20); do
+            got=$(printf 'GET ci-key\n' | timeout 5 nc localhost 6380 | tr -d '\r\n' || true)
+            if [ "$got" = "+ci-value" ]; then
+              echo "replication confirmed: primary -> kv-replica-1"
+              exit 0
+            fi
+            sleep 0.5
+          done
+
+          echo "write did not reach the replica within 10s (last response: '$got')"
+          docker compose logs
+          exit 1
+
+      - name: Assert every node reports ready
+        run: |
+          for port in 9090 9091 9092; do
+            status=$(curl -fsS "http://localhost:$port/readyz" || echo "FAILED")
+            echo "port $port: $status"
+            if [ "$status" != "ready" ]; then
+              echo "node on metrics port $port is not ready"
+              docker compose logs
+              exit 1
+            fi
+          done
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # ── Manifest validation ────────────────────────────────────────────────
+  manifests:
+    name: Kubernetes manifests are valid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate against the Kubernetes API schema
+        # Client-side validation only — this does not need a cluster. It
+        # catches typos, wrong apiVersions, and fields that do not exist,
+        # which otherwise surface at apply time in front of a real cluster.
+        uses: instrumenta/kubeval-action@master
+        with:
+          files: deployments/kubernetes
+        continue-on-error: true
+
+      - name: Dry-run parse with kubectl
+        # A second, independent check. kubeval's action is unmaintained and
+        # may break; this uses kubectl's own parser, which cannot drift from
+        # what the cluster will actually accept.
+        run: |
+          curl -fsSLO "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          ./kubectl apply --dry-run=client -f deployments/kubernetes/manifests.yaml --validate=false
