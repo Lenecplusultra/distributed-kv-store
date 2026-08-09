@@ -17,10 +17,30 @@
 // after 30 seconds, the key would get 60 more seconds instead of 30.
 // Absolute timestamps survive restarts correctly.
 //
-// # Known constraint
+// (The wire protocol calls the absolute form EXAT and reserves EX for
+// relative seconds. The WAL predates that split and uses the EX label for
+// what is really an EXAT value. The two are never exchanged, so this is a
+// naming inconsistency rather than a correctness bug — but it is the kind
+// of thing worth renaming before someone reads the file and misinterprets
+// it.)
 //
-// Keys and values must not contain spaces. This matches the current wire
-// protocol limitation and will be addressed when we move to binary framing.
+// # Concurrency
+//
+// A WAL is safe for concurrent use. Every mutating operation holds a mutex.
+//
+// This was not always true, and the way it failed is instructive. The server
+// runs one goroutine per connection, so Append was being called concurrently
+// by every client at once. bufio.Writer is not safe for concurrent use:
+// simultaneous writers corrupt its internal offset, the length check fails,
+// and io.ErrShortWrite comes back. Worse, bufio latches that error and
+// returns it on every subsequent call forever, so a single racing moment
+// turned the node permanently write-rejecting while it continued to accept
+// connections and serve reads.
+//
+// The tests missed it because wal_test.go exercised Append single-threaded
+// and every TCP server test passed a nil WAL — so the one path where
+// concurrency met the WAL had no coverage at all. A 50-client benchmark
+// found it in ten seconds.
 //
 // # Durability tradeoff
 //
@@ -38,6 +58,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Lenecplusultra/distributed-kv-store/internal/storage"
@@ -53,7 +74,11 @@ type Entry struct {
 }
 
 // WAL wraps an append-only file.
+//
+// Safe for concurrent use: mu guards both the file handle and the buffered
+// writer, neither of which tolerates concurrent access on its own.
 type WAL struct {
+	mu     sync.Mutex
 	file   *os.File
 	writer *bufio.Writer
 }
@@ -75,31 +100,77 @@ func Open(path string) (*WAL, error) {
 // Must be called BEFORE the corresponding in-memory write.
 // If the process crashes after Append but before the store write,
 // replay will re-apply the entry — idempotent for SET, safe for DEL.
+//
+// Safe to call from multiple goroutines.
 func (w *WAL) Append(e Entry) error {
-	var line string
+	line, err := encode(e)
+	if err != nil {
+		return err
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if _, err := w.writer.WriteString(line); err != nil {
+		w.resetWriterLocked()
+		return fmt.Errorf("wal write: %w", err)
+	}
+
+	// Flush to OS buffer. Not fsync — see package doc for the tradeoff.
+	if err := w.writer.Flush(); err != nil {
+		w.resetWriterLocked()
+		return fmt.Errorf("wal flush: %w", err)
+	}
+	return nil
+}
+
+// resetWriterLocked discards the buffered writer's state, including any
+// latched error, and rebinds it to the file.
+//
+// bufio.Writer never clears an error on its own: once one write fails, every
+// subsequent call returns that same error indefinitely. Without this reset a
+// single transient failure would leave the node permanently unable to accept
+// writes while still accepting connections, serving reads, and reporting
+// itself healthy — a silent brick rather than an honest crash.
+//
+// Any bytes still buffered at the point of failure are discarded. That is
+// correct for a write-ahead log: the caller is told the append failed, so
+// those bytes must not later appear in the file as though they had
+// succeeded. The caller must hold w.mu.
+func (w *WAL) resetWriterLocked() {
+	w.writer.Reset(w.file)
+}
+
+// encode renders an entry as a single log line.
+func encode(e Entry) (string, error) {
 	switch e.Op {
 	case "SET":
 		if e.HasTTL {
-			line = fmt.Sprintf("SET %s %s EX %d\n", e.Key, e.Value, e.ExpiresAt.UnixNano())
-		} else {
-			line = fmt.Sprintf("SET %s %s\n", e.Key, e.Value)
+			return fmt.Sprintf("SET %s %s EX %d\n", e.Key, e.Value, e.ExpiresAt.UnixNano()), nil
 		}
+		return fmt.Sprintf("SET %s %s\n", e.Key, e.Value), nil
 	case "DEL":
-		line = fmt.Sprintf("DEL %s\n", e.Key)
+		return fmt.Sprintf("DEL %s\n", e.Key), nil
 	default:
-		return fmt.Errorf("wal: unknown op %q", e.Op)
+		return "", fmt.Errorf("wal: unknown op %q", e.Op)
 	}
-
-	if _, err := fmt.Fprint(w.writer, line); err != nil {
-		return fmt.Errorf("wal write: %w", err)
-	}
-	// Flush to OS buffer. Not fsync — see package doc for the tradeoff.
-	return w.writer.Flush()
 }
 
 // Replay reads every entry from the beginning of the log and calls fn
 // for each one. Used during startup to restore in-memory state.
+//
+// Holds the mutex for the duration: it seeks the shared file handle, which
+// would otherwise move the append cursor under a concurrent writer.
 func (w *WAL) Replay(fn func(Entry)) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// Flush anything buffered so replay sees a complete file.
+	if err := w.writer.Flush(); err != nil {
+		w.resetWriterLocked()
+		return fmt.Errorf("wal flush before replay: %w", err)
+	}
+
 	// Seek to the beginning — the file was opened in append mode so
 	// the write cursor is at the end, but we can still read from start.
 	if _, err := w.file.Seek(0, 0); err != nil {
@@ -147,7 +218,11 @@ func Recover(w *WAL, s *storage.Store) error {
 
 // Close flushes any buffered data and closes the file.
 func (w *WAL) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	if err := w.writer.Flush(); err != nil {
+		w.file.Close()
 		return err
 	}
 	return w.file.Close()
